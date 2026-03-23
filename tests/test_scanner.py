@@ -518,6 +518,9 @@ class TestWriteResults:
             stats = summarize_results_sqlite(path)
             assert stats["total_results"] == 2
             assert stats["open_results"] == 1
+            assert stats["unreachable_results"] == 2
+            assert stats["tcp_only_results"] == 0
+            assert stats["identified_results"] == 0
         finally:
             os.unlink(path)
 
