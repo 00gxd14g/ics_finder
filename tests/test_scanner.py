@@ -5,6 +5,7 @@ import ipaddress
 import json
 import os
 import socket
+import struct
 import tempfile
 import threading
 import time
@@ -19,6 +20,7 @@ from ics_finder.scanner import (
     write_results_json,
     MODBUS_PORT,
     _MODBUS_READ_COILS,
+    _build_modbus_request,
 )
 
 
@@ -78,6 +80,32 @@ def _start_modbus_stub_server() -> tuple[socket.socket, int]:
                     conn, _ = srv.accept()
                     conn.recv(12)   # consume the request
                     conn.sendall(response)
+                    conn.close()
+                except socket.timeout:
+                    break
+        except OSError:
+            pass
+
+    t = threading.Thread(target=_handle, daemon=True)
+    t.start()
+    return srv, port
+
+
+def _start_banner_server(banner: bytes = b"HELLO_BANNER") -> tuple[socket.socket, int]:
+    """Start a TCP server that sends a banner immediately on connection."""
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(5)
+    port = srv.getsockname()[1]
+
+    def _handle():
+        srv.settimeout(5)
+        try:
+            while True:
+                try:
+                    conn, _ = srv.accept()
+                    conn.sendall(banner)
                     conn.close()
                 except socket.timeout:
                     break
@@ -225,3 +253,114 @@ class TestWriteResults:
             assert ips == {"10.0.0.1", "10.0.0.2"}
         finally:
             os.unlink(path)
+
+
+# ─────────────────────────────────────────────────────────────
+# Tests for new features: banner grabbing, WAF bypass, jitter
+# ─────────────────────────────────────────────────────────────
+
+
+class TestBuildModbusRequest:
+    def test_valid_modbus_frame(self):
+        """Generated request must be a well-formed Modbus Read Coils frame."""
+        req = _build_modbus_request()
+        assert len(req) == 12
+        tx_id, proto_id, length, unit, fc, start, qty = struct.unpack(">HHHBBHH", req)
+        assert proto_id == 0x0000
+        assert length == 0x0006
+        assert unit == 0x01
+        assert fc == 0x01
+
+    def test_randomised_transaction_id(self):
+        """Multiple calls should produce different transaction IDs."""
+        tx_ids = set()
+        for _ in range(50):
+            req = _build_modbus_request()
+            tx_id = struct.unpack(">H", req[:2])[0]
+            tx_ids.add(tx_id)
+        # With 50 attempts and a 16-bit range, duplicates are extremely unlikely.
+        assert len(tx_ids) > 1
+
+
+class TestBannerGrab:
+    def test_banner_grab_captures_data(self):
+        """With banner_grab=True the scanner should capture unsolicited data."""
+        banner_bytes = b"HELLO_BANNER"
+        srv, port = _start_banner_server(banner_bytes)
+        try:
+            results = scan_networks(
+                [parse_network("127.0.0.1/32")],
+                port=port,
+                concurrency=1,
+                timeout=2.0,
+                verify_modbus=False,
+                hits_only=True,
+                banner_grab=True,
+            )
+        finally:
+            srv.close()
+
+        assert len(results) == 1
+        assert results[0].open is True
+        assert results[0].banner == banner_bytes.hex()
+
+    def test_no_banner_grab_returns_none(self):
+        """Without banner_grab the banner field should remain None."""
+        srv, port = _start_banner_server(b"DATA")
+        try:
+            results = scan_networks(
+                [parse_network("127.0.0.1/32")],
+                port=port,
+                concurrency=1,
+                timeout=2.0,
+                verify_modbus=False,
+                hits_only=True,
+                banner_grab=False,
+            )
+        finally:
+            srv.close()
+
+        assert len(results) == 1
+        assert results[0].banner is None
+
+
+class TestRandomizeHosts:
+    def test_randomize_does_not_lose_hosts(self):
+        """Randomise must still scan all hosts in the target range."""
+        srv, port = _start_echo_server()
+        try:
+            results = scan_networks(
+                [parse_network("127.0.0.1/32")],
+                port=port,
+                concurrency=1,
+                timeout=2.0,
+                verify_modbus=False,
+                hits_only=True,
+                randomize_hosts=True,
+            )
+        finally:
+            srv.close()
+
+        assert len(results) == 1
+        assert results[0].open is True
+
+
+class TestJitter:
+    def test_jitter_does_not_break_scan(self):
+        """A small jitter value should not prevent the scan from completing."""
+        srv, port = _start_echo_server()
+        try:
+            results = scan_networks(
+                [parse_network("127.0.0.1/32")],
+                port=port,
+                concurrency=1,
+                timeout=2.0,
+                verify_modbus=False,
+                hits_only=True,
+                jitter=0.01,
+            )
+        finally:
+            srv.close()
+
+        assert len(results) == 1
+        assert results[0].open is True
