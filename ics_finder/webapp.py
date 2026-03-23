@@ -29,7 +29,10 @@ _MODBUS_EXCEPTION_LABELS = {
 def _parse_limit(parsed_query: dict[str, list[str]], default: int = 200, maximum: int = 1000) -> int:
     """Parse and validate a positive integer limit from query parameters."""
     raw_limit = parsed_query.get("limit", [str(default)])[0]
-    limit = int(raw_limit)
+    try:
+        limit = int(raw_limit)
+    except ValueError as exc:
+        raise ValueError("limit must be a valid integer") from exc
     if limit < 1:
         raise ValueError("limit must be a positive integer")
     return min(limit, maximum)
@@ -56,12 +59,12 @@ def _parse_device_info(device_info: Optional[str]) -> dict[str, str]:
             parsed["vendor"] = value
         elif key == "1":
             parsed["product"] = value
-            if parsed["model"] == "Unknown":
-                parsed["model"] = value
         elif key == "2":
             parsed["revision"] = value
         elif key == "3":
             parsed["model"] = value
+    if parsed["model"] == "Unknown" and parsed["product"] != "Unknown":
+        parsed["model"] = parsed["product"]
     return parsed
 
 
@@ -233,9 +236,9 @@ def _render_dashboard_html(database_path: str) -> str:
       <div class="brand-title">SCADA_SCANNER<span>_</span></div>
     </div>
     <nav class="tabs" aria-label="Dashboard sections">
-      <button class="tab-button active" data-tab="overview">GENEL BAKIŞ</button>
-      <button class="tab-button" data-tab="devices">CİHAZLAR</button>
-      <button class="tab-button" data-tab="api">API</button>
+      <button class="tab-button active" data-tab="overview" aria-label="Overview section">GENEL BAKIŞ</button>
+      <button class="tab-button" data-tab="devices" aria-label="Devices section">CİHAZLAR</button>
+      <button class="tab-button" data-tab="api" aria-label="API section">API</button>
     </nav>
   </header>
   <div class="wrap">
