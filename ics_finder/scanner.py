@@ -48,6 +48,8 @@ import logging
 import os
 import random
 import shutil
+import socket
+import sqlite3
 import struct
 import subprocess
 import tempfile
@@ -63,6 +65,32 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────
 
 MODBUS_PORT: int = 502
+S7COMM_PORT: int = 102
+ETHERNET_IP_PORT: int = 44818
+BACNET_PORT: int = 47808
+DNP3_PORT: int = 20000
+
+PROTOCOL_MODBUS = "modbus"
+PROTOCOL_S7COMM = "s7comm"
+PROTOCOL_ETHERNET_IP = "ethernet_ip"
+PROTOCOL_BACNET = "bacnet"
+PROTOCOL_DNP3 = "dnp3"
+
+PROTOCOL_LABELS: Dict[str, str] = {
+    PROTOCOL_MODBUS: "Modbus/TCP",
+    PROTOCOL_S7COMM: "S7comm",
+    PROTOCOL_ETHERNET_IP: "EtherNet/IP",
+    PROTOCOL_BACNET: "BACnet/IP",
+    PROTOCOL_DNP3: "DNP3",
+}
+
+PROTOCOL_DEFAULT_PORTS: Dict[str, int] = {
+    PROTOCOL_MODBUS: MODBUS_PORT,
+    PROTOCOL_S7COMM: S7COMM_PORT,
+    PROTOCOL_ETHERNET_IP: ETHERNET_IP_PORT,
+    PROTOCOL_BACNET: BACNET_PORT,
+    PROTOCOL_DNP3: DNP3_PORT,
+}
 
 # Modbus "Read Coils" (FC 01) request:
 #   Transaction ID  : 0x0001
@@ -105,6 +133,48 @@ VALIDATION_TCP_ONLY: str = "tcp_only"
 VALIDATION_MODBUS_EXCEPTION: str = "modbus_exception"
 VALIDATION_MODBUS_CONFIRMED: str = "modbus_confirmed"
 VALIDATION_MODBUS_DEVICE_ID: str = "modbus_device_id"
+VALIDATION_PROTOCOL_CONFIRMED: str = "protocol_confirmed"
+VALIDATION_IDENTITY_CONFIRMED: str = "identity_confirmed"
+
+
+def normalize_protocol(protocol: Optional[str]) -> str:
+    """Return a canonical protocol key."""
+    aliases = {
+        None: PROTOCOL_MODBUS,
+        "": PROTOCOL_MODBUS,
+        "modbus": PROTOCOL_MODBUS,
+        "modbus/tcp": PROTOCOL_MODBUS,
+        "s7": PROTOCOL_S7COMM,
+        "s7comm": PROTOCOL_S7COMM,
+        "ethernet-ip": PROTOCOL_ETHERNET_IP,
+        "ethernet_ip": PROTOCOL_ETHERNET_IP,
+        "enip": PROTOCOL_ETHERNET_IP,
+        "bacnet": PROTOCOL_BACNET,
+        "bacnet/ip": PROTOCOL_BACNET,
+        "dnp3": PROTOCOL_DNP3,
+    }
+    key = (protocol or "").strip().lower()
+    return aliases.get(key, key)
+
+
+def protocol_label(protocol: Optional[str]) -> str:
+    """Return the human-readable label for *protocol*."""
+    key = normalize_protocol(protocol)
+    return PROTOCOL_LABELS.get(key, key or PROTOCOL_LABELS[PROTOCOL_MODBUS])
+
+
+def default_port_for_protocol(protocol: Optional[str]) -> int:
+    """Return the default well-known port for *protocol*."""
+    key = normalize_protocol(protocol)
+    return PROTOCOL_DEFAULT_PORTS.get(key, MODBUS_PORT)
+
+
+def infer_protocol_from_port(port: int) -> str:
+    """Infer the protocol key from a well-known ICS port."""
+    for protocol, default_port in PROTOCOL_DEFAULT_PORTS.items():
+        if default_port == port:
+            return protocol
+    return PROTOCOL_MODBUS
 
 
 # ─────────────────────────────────────────────────────────────
@@ -145,6 +215,42 @@ def _build_device_id_request(unit_id: int = 0x01) -> bytes:
     return struct.pack(
         ">HHHBBBBB", tx_id, 0x0000, 0x0005, unit_id, 0x2B, 0x0E, 0x01, 0x00
     )
+
+
+def _build_s7_cotp_connect_request() -> bytes:
+    """Build a basic TPKT/COTP connection request used by S7comm."""
+    return bytes.fromhex(
+        "0300001611e00000000100c1020100c2020102c0010a"
+    )
+
+
+def _build_enip_list_identity_request() -> bytes:
+    """Build an EtherNet/IP ListIdentity encapsulation request."""
+    return struct.pack("<HHIIQI", 0x0063, 0, 0, 0, 0, 0)
+
+
+def _dnp3_crc(data: bytes) -> int:
+    """Compute the CRC used by DNP3 link-layer frames."""
+    crc = 0x0000
+    for byte in data:
+        crc ^= byte
+        for _ in range(8):
+            if crc & 0x0001:
+                crc = (crc >> 1) ^ 0xA6BC
+            else:
+                crc >>= 1
+    return (~crc) & 0xFFFF
+
+
+def _build_dnp3_link_status_request(destination: int = 1, source: int = 1024) -> bytes:
+    """Build a DNP3 link-status request frame."""
+    header = b"\x05\x64\x05\xc9" + struct.pack("<HH", destination, source)
+    return header + struct.pack("<H", _dnp3_crc(header))
+
+
+def _build_bacnet_who_is_request() -> bytes:
+    """Build a minimal BACnet/IP Who-Is request."""
+    return bytes.fromhex("810a000801201008")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -216,6 +322,63 @@ def _parse_device_id_response(raw: bytes) -> Optional[str]:
     return "; ".join(parts) if parts else None
 
 
+def _parse_s7_cotp_response(raw: bytes) -> bool:
+    """Return ``True`` when *raw* looks like an S7 COTP connection confirm."""
+    return len(raw) >= 7 and raw[0] == 0x03 and raw[1] == 0x00 and raw[5] == 0xD0
+
+
+def _parse_enip_identity_response(raw: bytes) -> Tuple[bool, Optional[str]]:
+    """Parse an EtherNet/IP ListIdentity response."""
+    if len(raw) < 24:
+        return False, None
+
+    command, _length = struct.unpack_from("<HH", raw, 0)
+    status = struct.unpack_from("<I", raw, 8)[0]
+    if command != 0x0063 or status != 0:
+        return False, None
+
+    payload = raw[24:]
+    if len(payload) < 8:
+        return True, None
+
+    item_count = struct.unpack_from("<H", payload, 6)[0]
+    pos = 8
+    for _ in range(item_count):
+        if pos + 4 > len(payload):
+            break
+        item_type, item_length = struct.unpack_from("<HH", payload, pos)
+        pos += 4
+        if pos + item_length > len(payload):
+            break
+        if item_type == 0x000C and item_length >= 33:
+            item = payload[pos : pos + item_length]
+            vendor_id = struct.unpack_from("<H", item, 18)[0]
+            revision = f"{item[24]}.{item[25]}"
+            product_name_len = item[32]
+            product_name = ""
+            if 33 + product_name_len <= len(item):
+                product_name = item[33 : 33 + product_name_len].decode(
+                    "ascii", errors="replace"
+                )
+            return True, (
+                f"vendor_id={vendor_id}; product_name={product_name or 'unknown'}; "
+                f"revision={revision}"
+            )
+        pos += item_length
+
+    return True, None
+
+
+def _parse_dnp3_response(raw: bytes) -> bool:
+    """Return ``True`` when *raw* looks like a DNP3 link-layer frame."""
+    return len(raw) >= 10 and raw[:2] == b"\x05\x64"
+
+
+def _parse_bacnet_response(raw: bytes) -> bool:
+    """Return ``True`` when *raw* looks like a BACnet/IP I-Am response."""
+    return len(raw) >= 8 and raw[0] == 0x81 and raw[6] == 0x10 and raw[7] == 0x00
+
+
 # ─────────────────────────────────────────────────────────────
 # Data classes
 # ─────────────────────────────────────────────────────────────
@@ -244,6 +407,13 @@ class ScanResult:
     open: bool
     modbus_verified: bool
     banner: Optional[str]
+    protocol: str = PROTOCOL_LABELS[PROTOCOL_MODBUS]
+    protocol_verified: bool = False
+    verification_level: int = 0
+    transport: str = "tcp"
+    tcp_latency_ms: Optional[float] = None
+    total_latency_ms: Optional[float] = None
+    raw_response: Optional[str] = None
     timestamp: float = dataclasses.field(default_factory=time.time)
     error: Optional[str] = None
     validation_level: str = VALIDATION_NO_ACCESS
@@ -265,6 +435,7 @@ async def _probe(
     timeout: float,
     verify_modbus: bool,
     banner_grab: bool = False,
+    protocol: str = PROTOCOL_MODBUS,
 ) -> ScanResult:
     """
     Attempt a TCP connection to *ip*:*port*.
@@ -283,6 +454,14 @@ async def _probe(
     If *banner_grab* is ``True`` and *verify_modbus* is ``False``, the scanner
     waits briefly for any unsolicited data from the server (service banner).
     """
+    protocol_key = normalize_protocol(protocol)
+    protocol_name = protocol_label(protocol_key)
+    started_at = time.monotonic()
+
+    if protocol_key == PROTOCOL_BACNET:
+        return await _probe_bacnet(ip, port, timeout, verify_modbus, protocol_name)
+
+    connect_started_at = time.monotonic()
     try:
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(ip, port),
@@ -295,60 +474,95 @@ async def _probe(
             open=False,
             modbus_verified=False,
             banner=None,
+            protocol=protocol_name,
+            protocol_verified=False,
+            verification_level=0,
+            tcp_latency_ms=round((time.monotonic() - connect_started_at) * 1000, 3),
+            total_latency_ms=round((time.monotonic() - started_at) * 1000, 3),
             error=str(exc),
             validation_level=VALIDATION_NO_ACCESS,
         )
 
+    protocol_verified = False
     modbus_verified = False
     banner: Optional[str] = None
+    raw_response: Optional[str] = None
     validation_level = VALIDATION_TCP_ONLY
+    verification_level = 1
     exception_code: Optional[int] = None
     device_info: Optional[str] = None
+    connect_latency_ms = round((time.monotonic() - connect_started_at) * 1000, 3)
 
     try:
         if verify_modbus:
-            # ── Phase 1: try Read Coils (FC 01) ──────────────────
-            is_modbus, is_exc, exc_c, _fc = await _send_and_parse(
-                reader, writer, _build_modbus_request(), timeout
-            )
-            if is_modbus and not is_exc:
-                modbus_verified = True
-                validation_level = VALIDATION_MODBUS_CONFIRMED
-            elif is_modbus and is_exc:
-                modbus_verified = True
-                validation_level = VALIDATION_MODBUS_EXCEPTION
-                exception_code = exc_c
-
-            # ── Phase 2: try Read Holding Registers (FC 03) ──────
-            if not is_modbus:
+            if protocol_key == PROTOCOL_MODBUS:
+                # ── Phase 1: try Read Coils (FC 01) ──────────────────
                 is_modbus, is_exc, exc_c, _fc = await _send_and_parse(
-                    reader, writer,
-                    _build_read_holding_registers_request(),
-                    timeout,
+                    reader, writer, _build_modbus_request(), timeout
                 )
                 if is_modbus and not is_exc:
+                    protocol_verified = True
                     modbus_verified = True
                     validation_level = VALIDATION_MODBUS_CONFIRMED
+                    verification_level = 2
                 elif is_modbus and is_exc:
+                    protocol_verified = True
                     modbus_verified = True
                     validation_level = VALIDATION_MODBUS_EXCEPTION
+                    verification_level = 2
                     exception_code = exc_c
 
-            # ── Phase 3: try Read Device Identification (FC 43) ──
-            if modbus_verified:
-                try:
-                    dev_req = _build_device_id_request()
-                    writer.write(dev_req)
-                    await asyncio.wait_for(writer.drain(), timeout=timeout)
-                    dev_raw: bytes = await asyncio.wait_for(
-                        reader.read(256), timeout=timeout,
+                # ── Phase 2: try Read Holding Registers (FC 03) ──────
+                if not is_modbus:
+                    is_modbus, is_exc, exc_c, _fc = await _send_and_parse(
+                        reader, writer,
+                        _build_read_holding_registers_request(),
+                        timeout,
                     )
-                    info = _parse_device_id_response(dev_raw)
-                    if info:
-                        device_info = info
-                        validation_level = VALIDATION_MODBUS_DEVICE_ID
-                except (asyncio.TimeoutError, OSError):
-                    pass
+                    if is_modbus and not is_exc:
+                        protocol_verified = True
+                        modbus_verified = True
+                        validation_level = VALIDATION_MODBUS_CONFIRMED
+                        verification_level = 2
+                    elif is_modbus and is_exc:
+                        protocol_verified = True
+                        modbus_verified = True
+                        validation_level = VALIDATION_MODBUS_EXCEPTION
+                        verification_level = 2
+                        exception_code = exc_c
+
+                # ── Phase 3: try Read Device Identification (FC 43) ──
+                if protocol_verified:
+                    try:
+                        dev_req = _build_device_id_request()
+                        writer.write(dev_req)
+                        await asyncio.wait_for(writer.drain(), timeout=timeout)
+                        dev_raw: bytes = await asyncio.wait_for(
+                            reader.read(256), timeout=timeout,
+                        )
+                        if dev_raw:
+                            raw_response = dev_raw.hex()
+                        info = _parse_device_id_response(dev_raw)
+                        if info:
+                            device_info = info
+                            validation_level = VALIDATION_MODBUS_DEVICE_ID
+                            verification_level = 3
+                    except (asyncio.TimeoutError, OSError):
+                        pass
+            else:
+                protocol_verified, device_info, raw_response = await _verify_tcp_protocol(
+                    reader=reader,
+                    writer=writer,
+                    protocol=protocol_key,
+                    timeout=timeout,
+                )
+                if protocol_verified:
+                    validation_level = (
+                        VALIDATION_IDENTITY_CONFIRMED
+                        if device_info
+                        else VALIDATION_PROTOCOL_CONFIRMED
+                    )
+                    verification_level = 3 if device_info else 2
 
         elif banner_grab:
             try:
@@ -358,6 +572,7 @@ async def _probe(
                 )
                 if raw:
                     banner = raw.hex()
+                    raw_response = banner
             except asyncio.TimeoutError:
                 pass
     except (asyncio.TimeoutError, OSError):
@@ -375,6 +590,12 @@ async def _probe(
         open=True,
         modbus_verified=modbus_verified,
         banner=banner,
+        protocol=protocol_name,
+        protocol_verified=protocol_verified or modbus_verified,
+        verification_level=verification_level,
+        tcp_latency_ms=connect_latency_ms,
+        total_latency_ms=round((time.monotonic() - started_at) * 1000, 3),
+        raw_response=raw_response,
         validation_level=validation_level,
         modbus_exception_code=exception_code,
         device_info=device_info,
@@ -402,6 +623,115 @@ async def _send_and_parse(
         return False, False, None, None
 
 
+async def _verify_tcp_protocol(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    protocol: str,
+    timeout: float,
+) -> Tuple[bool, Optional[str], Optional[str]]:
+    """Send a protocol-specific TCP verification probe."""
+    requests = {
+        PROTOCOL_S7COMM: _build_s7_cotp_connect_request,
+        PROTOCOL_ETHERNET_IP: _build_enip_list_identity_request,
+        PROTOCOL_DNP3: _build_dnp3_link_status_request,
+    }
+    builders = {
+        PROTOCOL_S7COMM: lambda raw: (_parse_s7_cotp_response(raw), None),
+        PROTOCOL_ETHERNET_IP: _parse_enip_identity_response,
+        PROTOCOL_DNP3: lambda raw: (_parse_dnp3_response(raw), None),
+    }
+
+    request_builder = requests.get(protocol)
+    response_parser = builders.get(protocol)
+    if request_builder is None or response_parser is None:
+        return False, None, None
+
+    try:
+        writer.write(request_builder())
+        await asyncio.wait_for(writer.drain(), timeout=timeout)
+        raw: bytes = await asyncio.wait_for(reader.read(512), timeout=timeout)
+    except (asyncio.TimeoutError, OSError):
+        return False, None, None
+
+    if not raw:
+        return False, None, None
+
+    is_valid, identity = response_parser(raw)
+    return is_valid, identity, raw.hex()
+
+
+async def _probe_bacnet(
+    ip: str,
+    port: int,
+    timeout: float,
+    verify_protocol: bool,
+    protocol_name: str,
+) -> ScanResult:
+    """Probe BACnet/IP over UDP with a Who-Is request."""
+    started_at = time.monotonic()
+    loop = asyncio.get_running_loop()
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setblocking(False)
+
+    try:
+        await loop.sock_connect(sock, (ip, port))
+        verification_level = 1
+        validation_level = VALIDATION_TCP_ONLY
+        raw_response = None
+        if verify_protocol:
+            await loop.sock_sendall(sock, _build_bacnet_who_is_request())
+            raw = await asyncio.wait_for(loop.sock_recv(sock, 512), timeout=timeout)
+            raw_response = raw.hex() if raw else None
+            if raw and _parse_bacnet_response(raw):
+                validation_level = VALIDATION_PROTOCOL_CONFIRMED
+                verification_level = 2
+                return ScanResult(
+                    ip=ip,
+                    port=port,
+                    open=True,
+                    modbus_verified=False,
+                    banner=None,
+                    protocol=protocol_name,
+                    protocol_verified=True,
+                    verification_level=verification_level,
+                    transport="udp",
+                    total_latency_ms=round((time.monotonic() - started_at) * 1000, 3),
+                    raw_response=raw_response,
+                    validation_level=validation_level,
+                )
+        return ScanResult(
+            ip=ip,
+            port=port,
+            open=not verify_protocol,
+            modbus_verified=False,
+            banner=None,
+            protocol=protocol_name,
+            protocol_verified=False,
+            verification_level=verification_level,
+            transport="udp",
+            total_latency_ms=round((time.monotonic() - started_at) * 1000, 3),
+            raw_response=raw_response,
+            validation_level=validation_level,
+        )
+    except (asyncio.TimeoutError, OSError) as exc:
+        return ScanResult(
+            ip=ip,
+            port=port,
+            open=False,
+            modbus_verified=False,
+            banner=None,
+            protocol=protocol_name,
+            protocol_verified=False,
+            verification_level=0,
+            transport="udp",
+            total_latency_ms=round((time.monotonic() - started_at) * 1000, 3),
+            error=str(exc),
+            validation_level=VALIDATION_NO_ACCESS,
+        )
+    finally:
+        sock.close()
+
+
 async def _worker(
     queue: asyncio.Queue,
     results: list,
@@ -411,6 +741,7 @@ async def _worker(
     hits_only: bool,
     banner_grab: bool = False,
     jitter: float = 0.0,
+    protocol: str = PROTOCOL_MODBUS,
 ) -> None:
     """Consume IP addresses from *queue* and append results to *results*.
 
@@ -422,13 +753,15 @@ async def _worker(
         try:
             if jitter > 0:
                 await asyncio.sleep(random.uniform(0, jitter))
-            result = await _probe(ip, port, timeout, verify_modbus, banner_grab)
+            result = await _probe(
+                ip, port, timeout, verify_modbus, banner_grab, protocol=protocol
+            )
             if not hits_only or result.open:
                 results.append(result)
             if result.open:
                 level = result.validation_level
-                verified_str = f" [{level}]" if result.modbus_verified else ""
-                logger.info("HIT  %s:%d%s", ip, port, verified_str)
+                verified_str = f" [{level}]" if result.protocol_verified else ""
+                logger.info("HIT  %s:%d (%s)%s", ip, port, result.protocol, verified_str)
         finally:
             queue.task_done()
 
@@ -444,6 +777,7 @@ async def _scan_async(
     banner_grab: bool = False,
     jitter: float = 0.0,
     randomize_hosts: bool = False,
+    protocol: str = PROTOCOL_MODBUS,
 ) -> List[ScanResult]:
     """Run the async scan and return all :class:`ScanResult` objects."""
     queue: asyncio.Queue = asyncio.Queue(maxsize=concurrency * 4)
@@ -452,7 +786,7 @@ async def _scan_async(
     workers = [
         asyncio.create_task(
             _worker(queue, results, port, timeout, verify_modbus, hits_only,
-                    banner_grab, jitter)
+                    banner_grab, jitter, protocol)
         )
         for _ in range(concurrency)
     ]
@@ -495,6 +829,7 @@ def scan_networks(
     banner_grab: bool = False,
     randomize_hosts: bool = False,
     jitter: float = 0.0,
+    protocol: str = PROTOCOL_MODBUS,
 ) -> List[ScanResult]:
     """
     Scan every host address in *networks* for a listening Modbus TCP service.
@@ -563,6 +898,7 @@ def scan_networks(
             banner_grab=banner_grab,
             jitter=jitter,
             randomize_hosts=randomize_hosts,
+            protocol=protocol,
         )
     )
 
@@ -674,6 +1010,7 @@ def scan_networks_fast(
     banner_grab: bool = False,
     randomize_hosts: bool = False,
     jitter: float = 0.0,
+    protocol: str = PROTOCOL_MODBUS,
 ) -> List[ScanResult]:
     """Two-phase scan: fast masscan discovery + async Modbus verification.
 
@@ -743,6 +1080,7 @@ def scan_networks_fast(
             banner_grab=banner_grab,
             jitter=jitter,
             randomize_hosts=randomize_hosts,
+            protocol=protocol,
         )
     )
 
@@ -752,8 +1090,10 @@ def scan_networks_fast(
 # ─────────────────────────────────────────────────────────────
 
 _CSV_FIELDNAMES = [
-    "ip", "port", "open", "modbus_verified", "validation_level",
-    "modbus_exception_code", "device_info", "banner", "timestamp", "error",
+    "ip", "port", "protocol", "transport", "open", "protocol_verified",
+    "verification_level", "modbus_verified", "validation_level",
+    "modbus_exception_code", "device_info", "banner", "tcp_latency_ms",
+    "total_latency_ms", "raw_response", "timestamp", "error",
 ]
 
 
@@ -783,3 +1123,108 @@ def write_results_json(results: Iterable[ScanResult], path: str) -> int:
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(records, fh, indent=2)
     return len(records)
+
+
+def write_results_sqlite(results: Iterable[ScanResult], path: str) -> int:
+    """Append *results* to an SQLite database at *path*."""
+    records = [r.as_dict() for r in results]
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS scan_results (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ip TEXT NOT NULL,
+                port INTEGER NOT NULL,
+                protocol TEXT NOT NULL,
+                transport TEXT NOT NULL,
+                open INTEGER NOT NULL,
+                protocol_verified INTEGER NOT NULL,
+                verification_level INTEGER NOT NULL,
+                modbus_verified INTEGER NOT NULL,
+                validation_level TEXT NOT NULL,
+                modbus_exception_code INTEGER,
+                device_info TEXT,
+                banner TEXT,
+                tcp_latency_ms REAL,
+                total_latency_ms REAL,
+                raw_response TEXT,
+                timestamp REAL NOT NULL,
+                error TEXT
+            )
+            """
+        )
+        conn.executemany(
+            """
+            INSERT INTO scan_results (
+                ip, port, protocol, transport, open, protocol_verified,
+                verification_level, modbus_verified, validation_level,
+                modbus_exception_code, device_info, banner, tcp_latency_ms,
+                total_latency_ms, raw_response, timestamp, error
+            ) VALUES (
+                :ip, :port, :protocol, :transport, :open, :protocol_verified,
+                :verification_level, :modbus_verified, :validation_level,
+                :modbus_exception_code, :device_info, :banner, :tcp_latency_ms,
+                :total_latency_ms, :raw_response, :timestamp, :error
+            )
+            """,
+            records,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return len(records)
+
+
+def load_results_sqlite(
+    path: str,
+    limit: int = 200,
+    protocol: Optional[str] = None,
+) -> List[Dict[str, object]]:
+    """Load the newest rows from an SQLite results database."""
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    try:
+        query = "SELECT * FROM scan_results"
+        params: List[object] = []
+        if protocol:
+            query += " WHERE protocol = ?"
+            params.append(protocol_label(protocol))
+        query += " ORDER BY timestamp DESC LIMIT ?"
+        params.append(limit)
+        rows = conn.execute(query, params).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def summarize_results_sqlite(path: str) -> Dict[str, object]:
+    """Return aggregate counts from an SQLite results database."""
+    conn = sqlite3.connect(path)
+    try:
+        total_rows = conn.execute("SELECT COUNT(*) FROM scan_results").fetchone()[0]
+        open_rows = conn.execute(
+            "SELECT COUNT(*) FROM scan_results WHERE open = 1"
+        ).fetchone()[0]
+        verified_rows = conn.execute(
+            "SELECT COUNT(*) FROM scan_results WHERE protocol_verified = 1"
+        ).fetchone()[0]
+        protocol_rows = conn.execute(
+            """
+            SELECT protocol, COUNT(*) AS count
+            FROM scan_results
+            GROUP BY protocol
+            ORDER BY count DESC, protocol ASC
+            """
+        ).fetchall()
+        return {
+            "total_results": total_rows,
+            "open_results": open_rows,
+            "verified_results": verified_rows,
+            "protocols": [
+                {"protocol": protocol, "count": count}
+                for protocol, count in protocol_rows
+            ],
+        }
+    finally:
+        conn.close()
