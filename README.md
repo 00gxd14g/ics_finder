@@ -21,7 +21,8 @@ produce false positives according to the
 2. Define target IP ranges  ──►  subtract exclusions
 3. Async TCP scan            ──►  probe port 502 on remaining IPs
 4. (Optional) Modbus verify  ──►  send Read Coils, check Modbus protocol ID
-5. Save results              ──►  CSV or JSON output
+5. Save results              ──►  CSV, JSON, or SQLite output
+6. Browse results            ──►  built-in SCADA-style dashboard / JSON API
 ```
 
 ---
@@ -36,9 +37,10 @@ produce false positives according to the
 | **Modbus verification** | Optionally sends a Modbus Read Coils (FC 01) request and validates the protocol identifier in the response |
 | **Banner grabbing** | Reads unsolicited service data from open ports (`--banner-grab`) |
 | **WAF bypass** | Randomised Modbus transaction IDs, host-order shuffling (`--randomize-hosts`), and inter-probe jitter (`--jitter`) |
-| **Flexible output** | CSV (default) or JSON |
+| **Flexible output** | CSV (default), JSON, and SQLite |
 | **Custom exclusions** | `--exclude CIDR`, `--exclude-file FILE`, or both, in addition to MISP lists |
 | **Custom targets** | `--target CIDR` (repeatable) or `--target-file FILE` |
+| **Built-in dashboard** | Serve stored SQLite results with a minimal SCADA-style web UI and JSON endpoints |
 
 ---
 
@@ -72,8 +74,23 @@ ics_finder --target 192.168.1.0/24 --output hits.csv
 
 ```bash
 ics_finder --target 192.168.1.0/24 \
-           --verify-modbus \
+           --verify-protocol \
            --output hits.json --format json
+```
+
+### Scan to SQLite and open the built-in dashboard
+
+```bash
+ics_finder --target 192.168.1.0/24 \
+           --verify-protocol \
+           --sqlite-output hits.db \
+           --serve
+```
+
+### Serve the dashboard from an existing SQLite database
+
+```bash
+ics_finder_dashboard hits.db --host 127.0.0.1 --port 8000
 ```
 
 ### Scan and exclude MISP warning lists
@@ -115,9 +132,11 @@ usage: ics_finder [-h] [--target CIDR] [--target-file FILE]
                   [--use-misp] [--misp-token TOKEN]
                   [--exclude CIDR] [--exclude-file FILE]
                   [--port PORT] [--concurrency N] [--timeout SECONDS]
-                  [--verify-modbus] [--all-results]
+                  [--verify-protocol] [--all-results]
                   [--banner-grab] [--randomize-hosts] [--jitter SECONDS]
-                  [--output FILE] [--format {csv,json}] [--verbose]
+                  [--output FILE] [--format {csv,json}]
+                  [--sqlite-output FILE] [--serve]
+                  [--serve-host HOST] [--serve-port PORT] [--verbose]
 ```
 
 | Option | Default | Description |
@@ -131,13 +150,17 @@ usage: ics_finder [-h] [--target CIDR] [--target-file FILE]
 | `--port PORT` | `502` | TCP port to probe |
 | `--concurrency N` | `500` | Parallel probes |
 | `--timeout SECONDS` | `30.0` | Per-probe TCP timeout |
-| `--verify-modbus` | off | Send Modbus FC 01 and verify protocol ID |
+| `--verify-protocol` / `--verify-modbus` | off | Send a protocol-specific verification request after TCP connect |
 | `--all-results` | off | Record closed ports too (default: hits only) |
 | `--banner-grab` | off | Read unsolicited service banner from open ports |
 | `--randomize-hosts` | off | Shuffle host scan order (WAF evasion) |
 | `--jitter SECONDS` | `0` | Max random delay before each probe (WAF evasion) |
 | `--output FILE` | `results.csv` | Output file path |
 | `--format {csv,json}` | `csv` | Output format |
+| `--sqlite-output FILE` | — | Append results to a SQLite database for dashboard/API use |
+| `--serve` | off | Start the built-in dashboard after writing results |
+| `--serve-host HOST` | `127.0.0.1` | Dashboard bind host |
+| `--serve-port PORT` | `8000` | Dashboard bind port |
 | `--verbose / -v` | off | Debug logging |
 
 ---
@@ -167,6 +190,15 @@ ip,port,open,modbus_verified,banner,timestamp,error
 ]
 ```
 
+### SQLite / dashboard API
+
+When `--sqlite-output` is used, results are appended to a `scan_results` table.
+The built-in dashboard serves the same data through:
+
+- `/api/stats` — aggregate counts and protocol breakdown
+- `/api/results?limit=200&protocol=Modbus/TCP` — raw result rows
+- `/api/dashboard?limit=200` — dashboard-oriented device + summary payload
+
 ---
 
 ## Project Layout
@@ -178,11 +210,13 @@ ics_finder/
 │   ├── misp_warninglists.py   # Download & parse MISP warning lists
 │   ├── ip_utils.py            # CIDR arithmetic (subtract, iterate, count)
 │   ├── scanner.py             # Async Modbus TCP scanner + result I/O
+│   ├── webapp.py              # Built-in SCADA-style dashboard + JSON API
 │   └── main.py                # CLI entry point
 ├── tests/
 │   ├── test_ip_utils.py
 │   ├── test_misp_warninglists.py
-│   └── test_scanner.py
+│   ├── test_scanner.py
+│   └── test_webapp.py
 ├── requirements.txt
 └── setup.py
 ```

@@ -1209,6 +1209,15 @@ def summarize_results_sqlite(path: str) -> Dict[str, object]:
         verified_rows = conn.execute(
             "SELECT COUNT(*) FROM scan_results WHERE protocol_verified = 1"
         ).fetchone()[0]
+        unreachable_rows = conn.execute(
+            "SELECT COUNT(*) FROM scan_results WHERE verification_level = 0"
+        ).fetchone()[0]
+        tcp_only_rows = conn.execute(
+            "SELECT COUNT(*) FROM scan_results WHERE verification_level = 1"
+        ).fetchone()[0]
+        identified_rows = conn.execute(
+            "SELECT COUNT(*) FROM scan_results WHERE verification_level >= 3"
+        ).fetchone()[0]
         protocol_rows = conn.execute(
             """
             SELECT protocol, COUNT(*) AS count
@@ -1221,6 +1230,9 @@ def summarize_results_sqlite(path: str) -> Dict[str, object]:
             "total_results": total_rows,
             "open_results": open_rows,
             "verified_results": verified_rows,
+            "unreachable_results": unreachable_rows,
+            "tcp_only_results": tcp_only_rows,
+            "identified_results": identified_rows,
             "protocols": [
                 {"protocol": protocol, "count": count}
                 for protocol, count in protocol_rows

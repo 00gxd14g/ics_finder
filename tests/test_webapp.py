@@ -46,9 +46,47 @@ def test_dashboard_endpoints():
         results = json.load(urllib.request.urlopen(f"http://{host}:{port}/api/results"))
         assert results[0]["protocol"] == "Modbus/TCP"
 
+        dashboard = json.load(
+            urllib.request.urlopen(f"http://{host}:{port}/api/dashboard?limit=1")
+        )
+        assert dashboard["stats"]["identified"] == 1
+        assert dashboard["devices"][0]["vendor"] == "TestVendor"
+        assert dashboard["devices"][0]["product"] == "Unknown"
+
         html = urllib.request.urlopen(f"http://{host}:{port}/").read().decode("utf-8")
-        assert "ICS Finder Dashboard" in html
+        assert "SCADA_SCANNER" in html
         assert "127.0.0.1" in html
+        assert "GENEL BAKIŞ" in html
+    finally:
+        if server is not None:
+            server.shutdown()
+            server.server_close()
+        if thread is not None:
+            thread.join(timeout=2)
+        os.unlink(path)
+
+
+def test_dashboard_rejects_invalid_limit():
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as fh:
+        path = fh.name
+
+    server = None
+    thread = None
+    try:
+        write_results_sqlite([], path)
+        server = build_dashboard_server(path, host="127.0.0.1", port=0)
+        host, port = server.server_address
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+
+        try:
+            urllib.request.urlopen(f"http://{host}:{port}/api/results?limit=0")
+        except urllib.error.HTTPError as exc:
+            assert exc.code == 400
+            payload = json.load(exc)
+            assert "positive integer" in payload["error"]
+        else:
+            raise AssertionError("expected HTTP 400 for invalid limit")
     finally:
         if server is not None:
             server.shutdown()
