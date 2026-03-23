@@ -51,7 +51,13 @@ from .misp_warninglists import (
     load_warninglists_from_file,
     networks_from_iterable,
 )
-from .scanner import scan_networks, write_results_csv, write_results_json, MODBUS_PORT
+from .scanner import (
+    scan_networks,
+    scan_networks_fast,
+    write_results_csv,
+    write_results_json,
+    MODBUS_PORT,
+)
 
 # ─────────────────────────────────────────────────────────────
 # Logging setup
@@ -194,6 +200,26 @@ def _build_parser() -> argparse.ArgumentParser:
             "probe to make scan traffic less predictable (default: 0)."
         ),
     )
+    scan_group.add_argument(
+        "--masscan",
+        action="store_true",
+        default=False,
+        help=(
+            "Use masscan for fast initial TCP port discovery (SYN scan), "
+            "then verify discovered hosts with Modbus protocol probes.  "
+            "Requires masscan to be installed and typically needs root."
+        ),
+    )
+    scan_group.add_argument(
+        "--masscan-rate",
+        type=int,
+        default=10_000,
+        metavar="PPS",
+        help=(
+            "masscan packet-sending rate in packets per second "
+            "(default: 10000).  Only used when --masscan is set."
+        ),
+    )
 
     # Output
     out_group = parser.add_argument_group("Output")
@@ -319,24 +345,54 @@ def main(argv: list[str] | None = None) -> None:
     log.info("Total host addresses to probe: %d", remaining_hosts)
 
     # 4. Run scanner
-    results = scan_networks(
-        scan_targets,
-        port=args.port,
-        concurrency=args.concurrency,
-        timeout=args.timeout,
-        verify_modbus=args.verify_modbus,
-        hits_only=not args.all_results,
-        progress_every=10_000,
-        banner_grab=args.banner_grab,
-        randomize_hosts=args.randomize_hosts,
-        jitter=args.jitter,
-    )
+    if args.masscan:
+        log.info("Using masscan for fast TCP discovery (rate=%d) …", args.masscan_rate)
+        try:
+            results = scan_networks_fast(
+                scan_targets,
+                port=args.port,
+                masscan_rate=args.masscan_rate,
+                concurrency=args.concurrency,
+                timeout=args.timeout,
+                hits_only=not args.all_results,
+                progress_every=10_000,
+                banner_grab=args.banner_grab,
+                randomize_hosts=args.randomize_hosts,
+                jitter=args.jitter,
+            )
+        except FileNotFoundError as exc:
+            log.error("%s", exc)
+            sys.exit(1)
+        except RuntimeError as exc:
+            log.error("masscan failed: %s", exc)
+            sys.exit(1)
+    else:
+        results = scan_networks(
+            scan_targets,
+            port=args.port,
+            concurrency=args.concurrency,
+            timeout=args.timeout,
+            verify_modbus=args.verify_modbus,
+            hits_only=not args.all_results,
+            progress_every=10_000,
+            banner_grab=args.banner_grab,
+            randomize_hosts=args.randomize_hosts,
+            jitter=args.jitter,
+        )
 
     hits = [r for r in results if r.open]
     log.info("Scan complete.  Open ports found: %d", len(hits))
-    if args.verify_modbus:
+    if args.verify_modbus or args.masscan:
         verified = [r for r in hits if r.modbus_verified]
         log.info("Modbus-verified devices: %d", len(verified))
+        exceptions = [r for r in hits if r.modbus_exception_code is not None]
+        if exceptions:
+            log.info(
+                "Devices responding with Modbus exceptions: %d", len(exceptions)
+            )
+        dev_id = [r for r in hits if r.device_info]
+        if dev_id:
+            log.info("Devices with device identification: %d", len(dev_id))
 
     # 5. Write results
     if args.format == "json":
