@@ -34,6 +34,8 @@ produce false positives according to the
 | **IP arithmetic** | Precise CIDR subtraction — no host is probed twice, none is missed |
 | **Async scanner** | `asyncio`-based; configurable concurrency (default 500 parallel probes) |
 | **Modbus verification** | Optionally sends a Modbus Read Coils (FC 01) request and validates the protocol identifier in the response |
+| **Banner grabbing** | Reads unsolicited service data from open ports (`--banner-grab`) |
+| **WAF bypass** | Randomised Modbus transaction IDs, host-order shuffling (`--randomize-hosts`), and inter-probe jitter (`--jitter`) |
 | **Flexible output** | CSV (default) or JSON |
 | **Custom exclusions** | `--exclude CIDR`, `--exclude-file FILE`, or both, in addition to MISP lists |
 | **Custom targets** | `--target CIDR` (repeatable) or `--target-file FILE` |
@@ -114,6 +116,7 @@ usage: ics_finder [-h] [--target CIDR] [--target-file FILE]
                   [--exclude CIDR] [--exclude-file FILE]
                   [--port PORT] [--concurrency N] [--timeout SECONDS]
                   [--verify-modbus] [--all-results]
+                  [--banner-grab] [--randomize-hosts] [--jitter SECONDS]
                   [--output FILE] [--format {csv,json}] [--verbose]
 ```
 
@@ -127,9 +130,12 @@ usage: ics_finder [-h] [--target CIDR] [--target-file FILE]
 | `--exclude-file FILE` | — | File with one exclusion CIDR/IP per line |
 | `--port PORT` | `502` | TCP port to probe |
 | `--concurrency N` | `500` | Parallel probes |
-| `--timeout SECONDS` | `3.0` | Per-probe TCP timeout |
+| `--timeout SECONDS` | `30.0` | Per-probe TCP timeout |
 | `--verify-modbus` | off | Send Modbus FC 01 and verify protocol ID |
 | `--all-results` | off | Record closed ports too (default: hits only) |
+| `--banner-grab` | off | Read unsolicited service banner from open ports |
+| `--randomize-hosts` | off | Shuffle host scan order (WAF evasion) |
+| `--jitter SECONDS` | `0` | Max random delay before each probe (WAF evasion) |
 | `--output FILE` | `results.csv` | Output file path |
 | `--format {csv,json}` | `csv` | Output format |
 | `--verbose / -v` | off | Debug logging |
@@ -221,6 +227,32 @@ CDN ranges, cloud provider CIDRs, Tor exit nodes, etc.).
 `ip-src`, …) and uses the extracted CIDR blocks as the exclusion set, so that
 your scan avoids probing addresses that are very unlikely to belong to isolated
 ICS installations.
+
+---
+
+## WAF Bypass Techniques
+
+`ics_finder` includes several lightweight techniques to reduce the chance that
+scans are blocked by stateful firewalls or Web Application Firewalls (WAFs):
+
+| Technique | CLI flag | Description |
+|---|---|---|
+| **Randomised transaction IDs** | always on | Each Modbus request uses a random transaction ID to avoid deterministic signatures |
+| **Host-order shuffling** | `--randomize-hosts` | Hosts are scanned in random order so that probes do not follow a sequential pattern |
+| **Inter-probe jitter** | `--jitter SECONDS` | A random delay (0 to *N* seconds) is inserted before each probe to vary traffic timing |
+
+### Example: scan with all WAF-bypass features enabled
+
+```bash
+ics_finder --target 10.0.0.0/16 \
+           --use-misp \
+           --verify-modbus \
+           --banner-grab \
+           --randomize-hosts \
+           --jitter 0.5 \
+           --timeout 30 \
+           --output results.csv
+```
 
 ---
 

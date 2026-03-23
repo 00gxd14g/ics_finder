@@ -147,9 +147,9 @@ def _build_parser() -> argparse.ArgumentParser:
     scan_group.add_argument(
         "--timeout",
         type=float,
-        default=3.0,
+        default=30.0,
         metavar="SECONDS",
-        help="TCP connection timeout per probe in seconds (default: 3.0).",
+        help="TCP connection timeout per probe in seconds (default: 30.0).",
     )
     scan_group.add_argument(
         "--verify-modbus",
@@ -165,6 +165,34 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=False,
         help="Record all probed addresses, not just open-port hits.",
+    )
+    scan_group.add_argument(
+        "--banner-grab",
+        action="store_true",
+        default=False,
+        help=(
+            "Read unsolicited service banner data from open ports, "
+            "even when --verify-modbus is not set."
+        ),
+    )
+    scan_group.add_argument(
+        "--randomize-hosts",
+        action="store_true",
+        default=False,
+        help=(
+            "Shuffle the host scan order to avoid sequential patterns "
+            "that stateful firewalls or WAFs could detect."
+        ),
+    )
+    scan_group.add_argument(
+        "--jitter",
+        type=float,
+        default=0.0,
+        metavar="SECONDS",
+        help=(
+            "Maximum random delay (in seconds) inserted before each "
+            "probe to make scan traffic less predictable (default: 0)."
+        ),
     )
 
     # Output
@@ -299,6 +327,9 @@ def main(argv: list[str] | None = None) -> None:
         verify_modbus=args.verify_modbus,
         hits_only=not args.all_results,
         progress_every=10_000,
+        banner_grab=args.banner_grab,
+        randomize_hosts=args.randomize_hosts,
+        jitter=args.jitter,
     )
 
     hits = [r for r in results if r.open]

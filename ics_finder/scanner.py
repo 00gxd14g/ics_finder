@@ -33,6 +33,7 @@ import dataclasses
 import ipaddress
 import json
 import logging
+import random
 import struct
 import time
 from typing import Dict, Iterable, List, Optional, Union
@@ -61,6 +62,22 @@ _MODBUS_READ_COILS: bytes = struct.pack(
 
 # Minimum bytes we need to validate a Modbus TCP header.
 _MBAP_HEADER_LEN: int = 6
+
+# Banner-grab timeout (seconds) — how long to wait for unsolicited data.
+_BANNER_READ_TIMEOUT: float = 2.0
+
+
+def _build_modbus_request() -> bytes:
+    """Build a Modbus Read Coils request with a randomised transaction ID.
+
+    Randomising the transaction ID on each probe avoids deterministic
+    signatures that stateful firewalls or WAFs could use to fingerprint
+    the scanner.
+    """
+    tx_id = random.randint(0x0001, 0xFFFE)
+    return struct.pack(
+        ">HHHBBHH", tx_id, 0x0000, 0x0006, 0x01, 0x01, 0x0000, 0x0001
+    )
 
 
 # ─────────────────────────────────────────────────────────────
@@ -94,13 +111,17 @@ async def _probe(
     port: int,
     timeout: float,
     verify_modbus: bool,
+    banner_grab: bool = False,
 ) -> ScanResult:
     """
     Attempt a TCP connection to *ip*:*port*.
 
     If *verify_modbus* is ``True`` we additionally send a Modbus Read Coils
-    request and check that the response carries a valid Modbus protocol
-    identifier (0x0000).
+    request (with a randomised transaction ID for WAF evasion) and check that
+    the response carries a valid Modbus protocol identifier (0x0000).
+
+    If *banner_grab* is ``True`` and *verify_modbus* is ``False``, the scanner
+    waits briefly for any unsolicited data from the server (service banner).
     """
     try:
         reader, writer = await asyncio.wait_for(
@@ -122,7 +143,7 @@ async def _probe(
 
     try:
         if verify_modbus:
-            writer.write(_MODBUS_READ_COILS)
+            writer.write(_build_modbus_request())
             await asyncio.wait_for(writer.drain(), timeout=timeout)
 
             raw: bytes = await asyncio.wait_for(
@@ -135,6 +156,17 @@ async def _probe(
                 modbus_verified = protocol_id == 0x0000
             if raw:
                 banner = raw.hex()
+        elif banner_grab:
+            # Wait briefly for any unsolicited data the service may send.
+            try:
+                raw = await asyncio.wait_for(
+                    reader.read(256),
+                    timeout=min(timeout, _BANNER_READ_TIMEOUT),
+                )
+                if raw:
+                    banner = raw.hex()
+            except asyncio.TimeoutError:
+                pass
     except (asyncio.TimeoutError, OSError):
         pass
     finally:
@@ -160,12 +192,20 @@ async def _worker(
     timeout: float,
     verify_modbus: bool,
     hits_only: bool,
+    banner_grab: bool = False,
+    jitter: float = 0.0,
 ) -> None:
-    """Consume IP addresses from *queue* and append results to *results*."""
+    """Consume IP addresses from *queue* and append results to *results*.
+
+    If *jitter* > 0, a random delay in ``[0, jitter]`` seconds is inserted
+    before each probe to make scan traffic less predictable (WAF evasion).
+    """
     while True:
         ip = await queue.get()
         try:
-            result = await _probe(ip, port, timeout, verify_modbus)
+            if jitter > 0:
+                await asyncio.sleep(random.uniform(0, jitter))
+            result = await _probe(ip, port, timeout, verify_modbus, banner_grab)
             if not hits_only or result.open:
                 results.append(result)
             if result.open:
@@ -183,6 +223,9 @@ async def _scan_async(
     verify_modbus: bool,
     hits_only: bool,
     progress_every: int,
+    banner_grab: bool = False,
+    jitter: float = 0.0,
+    randomize_hosts: bool = False,
 ) -> List[ScanResult]:
     """Run the async scan and return all :class:`ScanResult` objects."""
     queue: asyncio.Queue = asyncio.Queue(maxsize=concurrency * 4)
@@ -190,13 +233,20 @@ async def _scan_async(
 
     workers = [
         asyncio.create_task(
-            _worker(queue, results, port, timeout, verify_modbus, hits_only)
+            _worker(queue, results, port, timeout, verify_modbus, hits_only,
+                    banner_grab, jitter)
         )
         for _ in range(concurrency)
     ]
 
+    addr_list: Iterable[str] = addresses
+    if randomize_hosts:
+        addr_list_materialized = list(addresses)
+        random.shuffle(addr_list_materialized)
+        addr_list = addr_list_materialized
+
     count = 0
-    for addr in addresses:
+    for addr in addr_list:
         await queue.put(addr)
         count += 1
         if progress_every and count % progress_every == 0:
@@ -220,10 +270,13 @@ def scan_networks(
     networks: Iterable[AnyNetwork],
     port: int = MODBUS_PORT,
     concurrency: int = 500,
-    timeout: float = 3.0,
+    timeout: float = 30.0,
     verify_modbus: bool = True,
     hits_only: bool = True,
     progress_every: int = 10_000,
+    banner_grab: bool = False,
+    randomize_hosts: bool = False,
+    jitter: float = 0.0,
 ) -> List[ScanResult]:
     """
     Scan every host address in *networks* for a listening Modbus TCP service.
@@ -238,7 +291,7 @@ def scan_networks(
     concurrency:
         Maximum number of simultaneous TCP probes.
     timeout:
-        Per-probe TCP connection timeout in seconds.
+        Per-probe TCP connection timeout in seconds (default: 30).
     verify_modbus:
         If ``True``, send a Modbus Read Coils request and verify the response
         before marking an address as a confirmed Modbus device.
@@ -247,6 +300,15 @@ def scan_networks(
         in the result list (saves memory for large scans).
     progress_every:
         Log a progress message every *N* addresses queued (0 to disable).
+    banner_grab:
+        If ``True``, attempt to read any unsolicited data (service banner) from
+        open ports even when *verify_modbus* is ``False``.
+    randomize_hosts:
+        If ``True``, shuffle the host addresses before scanning so that probes
+        do not follow a predictable sequential pattern (WAF evasion).
+    jitter:
+        Maximum random delay in seconds inserted before each probe.  A value
+        of ``0`` (default) disables jitter.
 
     Returns
     -------
@@ -280,6 +342,9 @@ def scan_networks(
             verify_modbus=verify_modbus,
             hits_only=hits_only,
             progress_every=progress_every,
+            banner_grab=banner_grab,
+            jitter=jitter,
+            randomize_hosts=randomize_hosts,
         )
     )
 
