@@ -82,6 +82,9 @@ _MBAP_HEADER_LEN: int = 6
 # Banner-grab timeout (seconds) — how long to wait for unsolicited data.
 _BANNER_READ_TIMEOUT: float = 2.0
 
+# Maximum time (seconds) to wait for a masscan subprocess to finish.
+_MASSCAN_TIMEOUT: int = 7200
+
 # Modbus exception responses carry FC | 0x80 as the function code.
 _MODBUS_EXCEPTION_MASK: int = 0x80
 
@@ -347,9 +350,6 @@ async def _probe(
                 except (asyncio.TimeoutError, OSError):
                     pass
 
-            # Capture whatever raw bytes we got as banner hex.
-            # (The last exchange's bytes are not easily available here,
-            #  so we re-use the banner from _send_and_parse if needed.)
         elif banner_grab:
             try:
                 raw = await asyncio.wait_for(
@@ -645,7 +645,7 @@ def masscan_discover(
         ]
         logger.info("Running masscan: %s", " ".join(cmd))
         proc = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=7200,
+            cmd, capture_output=True, text=True, timeout=_MASSCAN_TIMEOUT,
         )
         if proc.returncode != 0:
             raise RuntimeError(
