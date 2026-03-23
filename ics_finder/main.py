@@ -56,7 +56,17 @@ from .scanner import (
     scan_networks_fast,
     write_results_csv,
     write_results_json,
+    write_results_sqlite,
+    default_port_for_protocol,
+    infer_protocol_from_port,
+    normalize_protocol,
+    protocol_label,
     MODBUS_PORT,
+    PROTOCOL_BACNET,
+    PROTOCOL_DNP3,
+    PROTOCOL_ETHERNET_IP,
+    PROTOCOL_MODBUS,
+    PROTOCOL_S7COMM,
 )
 
 # ─────────────────────────────────────────────────────────────
@@ -139,9 +149,25 @@ def _build_parser() -> argparse.ArgumentParser:
     scan_group.add_argument(
         "--port",
         type=int,
-        default=MODBUS_PORT,
+        default=None,
         metavar="PORT",
-        help=f"TCP port to probe (default: {MODBUS_PORT}).",
+        help="Port to probe. Defaults to the selected protocol's well-known port.",
+    )
+    scan_group.add_argument(
+        "--protocol",
+        choices=[
+            PROTOCOL_MODBUS,
+            PROTOCOL_S7COMM,
+            PROTOCOL_ETHERNET_IP,
+            PROTOCOL_BACNET,
+            PROTOCOL_DNP3,
+            "auto",
+        ],
+        default="auto",
+        help=(
+            "ICS protocol to verify. Use 'auto' to infer it from --port; "
+            "defaults to Modbus when the port is unknown."
+        ),
     )
     scan_group.add_argument(
         "--concurrency",
@@ -158,12 +184,14 @@ def _build_parser() -> argparse.ArgumentParser:
         help="TCP connection timeout per probe in seconds (default: 30.0).",
     )
     scan_group.add_argument(
+        "--verify-protocol",
         "--verify-modbus",
         action="store_true",
+        dest="verify_protocol",
         default=False,
         help=(
-            "After a successful TCP connection, send a Modbus Read Coils "
-            "request and verify the response before recording a hit."
+            "After transport-level reachability, send a protocol-specific "
+            "verification request before recording a confirmed ICS service."
         ),
     )
     scan_group.add_argument(
@@ -234,6 +262,33 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=["csv", "json"],
         default="csv",
         help="Output format (default: csv).",
+    )
+    out_group.add_argument(
+        "--sqlite-output",
+        metavar="FILE",
+        default=None,
+        help="Optional SQLite database file that receives appended scan results.",
+    )
+
+    web_group = parser.add_argument_group("Web dashboard")
+    web_group.add_argument(
+        "--serve",
+        action="store_true",
+        default=False,
+        help="Start the built-in dashboard after writing results.",
+    )
+    web_group.add_argument(
+        "--serve-host",
+        default="127.0.0.1",
+        metavar="HOST",
+        help="Dashboard bind host (default: 127.0.0.1).",
+    )
+    web_group.add_argument(
+        "--serve-port",
+        type=int,
+        default=8000,
+        metavar="PORT",
+        help="Dashboard bind port (default: 8000).",
     )
 
     # Misc
@@ -322,6 +377,15 @@ def main(argv: list[str] | None = None) -> None:
     _setup_logging(args.verbose)
     log = logging.getLogger(__name__)
 
+    protocol = (
+        infer_protocol_from_port(args.port)
+        if args.protocol == "auto" and args.port is not None
+        else normalize_protocol(args.protocol)
+    )
+    port = args.port if args.port is not None else default_port_for_protocol(protocol)
+    log.info("Protocol: %s", protocol_label(protocol))
+    log.info("Probe port: %d", port)
+
     # 1. Resolve targets
     targets = _load_targets(args)
     log.info("Target networks: %d", len(targets))
@@ -350,7 +414,7 @@ def main(argv: list[str] | None = None) -> None:
         try:
             results = scan_networks_fast(
                 scan_targets,
-                port=args.port,
+                port=port,
                 masscan_rate=args.masscan_rate,
                 concurrency=args.concurrency,
                 timeout=args.timeout,
@@ -359,6 +423,7 @@ def main(argv: list[str] | None = None) -> None:
                 banner_grab=args.banner_grab,
                 randomize_hosts=args.randomize_hosts,
                 jitter=args.jitter,
+                protocol=protocol,
             )
         except FileNotFoundError as exc:
             log.error("%s", exc)
@@ -369,22 +434,23 @@ def main(argv: list[str] | None = None) -> None:
     else:
         results = scan_networks(
             scan_targets,
-            port=args.port,
+            port=port,
             concurrency=args.concurrency,
             timeout=args.timeout,
-            verify_modbus=args.verify_modbus,
+            verify_modbus=args.verify_protocol,
             hits_only=not args.all_results,
             progress_every=10_000,
             banner_grab=args.banner_grab,
             randomize_hosts=args.randomize_hosts,
             jitter=args.jitter,
+            protocol=protocol,
         )
 
     hits = [r for r in results if r.open]
     log.info("Scan complete.  Open ports found: %d", len(hits))
-    if args.verify_modbus or args.masscan:
-        verified = [r for r in hits if r.modbus_verified]
-        log.info("Modbus-verified devices: %d", len(verified))
+    if args.verify_protocol or args.masscan:
+        verified = [r for r in hits if r.protocol_verified]
+        log.info("%s verified devices: %d", protocol_label(protocol), len(verified))
         exceptions = [r for r in hits if r.modbus_exception_code is not None]
         if exceptions:
             log.info(
@@ -401,6 +467,27 @@ def main(argv: list[str] | None = None) -> None:
         written = write_results_csv(results, args.output)
 
     log.info("Results written to %r (%d record(s)).", args.output, written)
+
+    if args.sqlite_output:
+        sqlite_written = write_results_sqlite(results, args.sqlite_output)
+        log.info(
+            "Results appended to SQLite database %r (%d record(s)).",
+            args.sqlite_output,
+            sqlite_written,
+        )
+
+    if args.serve:
+        if not args.sqlite_output:
+            log.error("--serve requires --sqlite-output so the dashboard has a data source.")
+            sys.exit(1)
+        from .webapp import serve_dashboard
+
+        log.info(
+            "Starting dashboard on http://%s:%d",
+            args.serve_host,
+            args.serve_port,
+        )
+        serve_dashboard(args.sqlite_output, host=args.serve_host, port=args.serve_port)
 
 
 if __name__ == "__main__":

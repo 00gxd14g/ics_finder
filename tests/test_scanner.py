@@ -14,17 +14,37 @@ import pytest
 
 from ics_finder.ip_utils import parse_network
 from ics_finder.scanner import (
+    BACNET_PORT,
+    DNP3_PORT,
+    ETHERNET_IP_PORT,
+    PROTOCOL_BACNET,
+    PROTOCOL_DNP3,
+    PROTOCOL_ETHERNET_IP,
+    PROTOCOL_MODBUS,
+    PROTOCOL_S7COMM,
+    S7COMM_PORT,
     ScanResult,
+    _build_bacnet_who_is_request,
+    _build_dnp3_link_status_request,
+    _build_enip_list_identity_request,
     scan_networks,
+    summarize_results_sqlite,
+    load_results_sqlite,
     write_results_csv,
     write_results_json,
+    write_results_sqlite,
     MODBUS_PORT,
     _MODBUS_READ_COILS,
     _build_modbus_request,
     _build_read_holding_registers_request,
     _build_device_id_request,
+    _build_s7_cotp_connect_request,
+    _parse_bacnet_response,
+    _parse_dnp3_response,
+    _parse_enip_identity_response,
     _parse_modbus_response,
     _parse_device_id_response,
+    _parse_s7_cotp_response,
     _parse_masscan_list_output,
     _MODBUS_EXCEPTION_MASK,
     VALIDATION_NO_ACCESS,
@@ -140,6 +160,129 @@ def _start_banner_server(banner: bytes = b"HELLO_BANNER") -> tuple[socket.socket
     return srv, port
 
 
+def _start_s7_stub_server() -> tuple[socket.socket, int]:
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(5)
+    port = srv.getsockname()[1]
+
+    response = bytes.fromhex("0300001611d0000100c0010ac1020100c2020102")
+
+    def _handle():
+        srv.settimeout(5)
+        try:
+            while True:
+                try:
+                    conn, _ = srv.accept()
+                    conn.recv(256)
+                    conn.sendall(response)
+                    conn.close()
+                except socket.timeout:
+                    break
+        except OSError:
+            pass
+
+    threading.Thread(target=_handle, daemon=True).start()
+    return srv, port
+
+
+def _build_enip_identity_response(product_name: str = "Test PLC") -> bytes:
+    item = (
+        struct.pack("<H", 1)
+        + (b"\x00" * 16)
+        + struct.pack("<H", 1337)
+        + struct.pack("<H", 12)
+        + struct.pack("<H", 34)
+        + bytes([1, 2])
+        + struct.pack("<H", 0)
+        + struct.pack("<I", 123456)
+        + bytes([len(product_name)])
+        + product_name.encode("ascii")
+        + b"\x01"
+    )
+    payload = (
+        struct.pack("<I", 0)
+        + struct.pack("<H", 0)
+        + struct.pack("<H", 1)
+        + struct.pack("<HH", 0x000C, len(item))
+        + item
+    )
+    header = struct.pack("<HHIIQI", 0x0063, len(payload), 0, 0, 0, 0)
+    return header + payload
+
+
+def _start_enip_stub_server() -> tuple[socket.socket, int]:
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(5)
+    port = srv.getsockname()[1]
+    response = _build_enip_identity_response()
+
+    def _handle():
+        srv.settimeout(5)
+        try:
+            while True:
+                try:
+                    conn, _ = srv.accept()
+                    conn.recv(256)
+                    conn.sendall(response)
+                    conn.close()
+                except socket.timeout:
+                    break
+        except OSError:
+            pass
+
+    threading.Thread(target=_handle, daemon=True).start()
+    return srv, port
+
+
+def _start_dnp3_stub_server() -> tuple[socket.socket, int]:
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(5)
+    port = srv.getsockname()[1]
+    response = bytes.fromhex("0564050b010000000000")
+
+    def _handle():
+        srv.settimeout(5)
+        try:
+            while True:
+                try:
+                    conn, _ = srv.accept()
+                    conn.recv(256)
+                    conn.sendall(response)
+                    conn.close()
+                except socket.timeout:
+                    break
+        except OSError:
+            pass
+
+    threading.Thread(target=_handle, daemon=True).start()
+    return srv, port
+
+
+def _start_bacnet_udp_server() -> tuple[socket.socket, int]:
+    srv = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    srv.bind(("127.0.0.1", 0))
+    port = srv.getsockname()[1]
+    response = bytes.fromhex("810a000801201000")
+
+    def _handle():
+        srv.settimeout(5)
+        try:
+            data, addr = srv.recvfrom(512)
+            if data:
+                srv.sendto(response, addr)
+        except (socket.timeout, OSError):
+            pass
+
+    threading.Thread(target=_handle, daemon=True).start()
+    return srv, port
+
+
 # ─────────────────────────────────────────────────────────────
 # Unit tests for ScanResult
 # ─────────────────────────────────────────────────────────────
@@ -157,8 +300,9 @@ class TestScanResult:
         d = r.as_dict()
         assert set(d.keys()) == {
             "ip", "port", "open", "modbus_verified", "banner",
-            "timestamp", "error", "validation_level",
-            "modbus_exception_code", "device_info",
+            "protocol", "protocol_verified", "verification_level", "transport",
+            "tcp_latency_ms", "total_latency_ms", "raw_response", "timestamp",
+            "error", "validation_level", "modbus_exception_code", "device_info",
         }
 
     def test_defaults(self):
@@ -238,6 +382,87 @@ class TestScanNetworks:
         assert len(results) == 1
         assert results[0].open is False
 
+    def test_s7_protocol_verification(self):
+        srv, port = _start_s7_stub_server()
+        try:
+            results = scan_networks(
+                [parse_network("127.0.0.1/32")],
+                port=port,
+                concurrency=1,
+                timeout=2.0,
+                verify_modbus=True,
+                hits_only=True,
+                protocol=PROTOCOL_S7COMM,
+            )
+        finally:
+            srv.close()
+
+        assert len(results) == 1
+        assert results[0].protocol == "S7comm"
+        assert results[0].protocol_verified is True
+        assert results[0].verification_level == 2
+
+    def test_enip_protocol_verification_with_identity(self):
+        srv, port = _start_enip_stub_server()
+        try:
+            results = scan_networks(
+                [parse_network("127.0.0.1/32")],
+                port=port,
+                concurrency=1,
+                timeout=2.0,
+                verify_modbus=True,
+                hits_only=True,
+                protocol=PROTOCOL_ETHERNET_IP,
+            )
+        finally:
+            srv.close()
+
+        assert len(results) == 1
+        assert results[0].protocol == "EtherNet/IP"
+        assert results[0].protocol_verified is True
+        assert "product_name=Test PLC" in results[0].device_info
+        assert results[0].verification_level == 3
+
+    def test_dnp3_protocol_verification(self):
+        srv, port = _start_dnp3_stub_server()
+        try:
+            results = scan_networks(
+                [parse_network("127.0.0.1/32")],
+                port=port,
+                concurrency=1,
+                timeout=2.0,
+                verify_modbus=True,
+                hits_only=True,
+                protocol=PROTOCOL_DNP3,
+            )
+        finally:
+            srv.close()
+
+        assert len(results) == 1
+        assert results[0].protocol == "DNP3"
+        assert results[0].protocol_verified is True
+        assert results[0].verification_level == 2
+
+    def test_bacnet_udp_verification(self):
+        srv, port = _start_bacnet_udp_server()
+        try:
+            results = scan_networks(
+                [parse_network("127.0.0.1/32")],
+                port=port,
+                concurrency=1,
+                timeout=2.0,
+                verify_modbus=True,
+                hits_only=True,
+                protocol=PROTOCOL_BACNET,
+            )
+        finally:
+            srv.close()
+
+        assert len(results) == 1
+        assert results[0].protocol == "BACnet/IP"
+        assert results[0].protocol_verified is True
+        assert results[0].transport == "udp"
+
 
 # ─────────────────────────────────────────────────────────────
 # Result serialisation tests
@@ -281,6 +506,21 @@ class TestWriteResults:
         finally:
             os.unlink(path)
 
+    def test_write_sqlite(self):
+        results = self._make_results()
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as fh:
+            path = fh.name
+        try:
+            written = write_results_sqlite(results, path)
+            assert written == 2
+            loaded = load_results_sqlite(path, limit=10)
+            assert len(loaded) == 2
+            stats = summarize_results_sqlite(path)
+            assert stats["total_results"] == 2
+            assert stats["open_results"] == 1
+        finally:
+            os.unlink(path)
+
 
 # ─────────────────────────────────────────────────────────────
 # Tests for new features: banner grabbing, WAF bypass, jitter
@@ -307,6 +547,30 @@ class TestBuildModbusRequest:
             tx_ids.add(tx_id)
         # With 50 attempts and a 16-bit range, duplicates are extremely unlikely.
         assert len(tx_ids) > 1
+
+
+class TestAdditionalProtocolParsers:
+    def test_s7_builder_and_parser(self):
+        req = _build_s7_cotp_connect_request()
+        assert req.startswith(b"\x03\x00")
+        assert _parse_s7_cotp_response(bytes.fromhex("0300001611d0000100c0010ac1020100c2020102"))
+
+    def test_enip_builder_and_parser(self):
+        req = _build_enip_list_identity_request()
+        assert len(req) == 24
+        is_valid, identity = _parse_enip_identity_response(_build_enip_identity_response())
+        assert is_valid is True
+        assert "product_name=Test PLC" in identity
+
+    def test_dnp3_builder_and_parser(self):
+        req = _build_dnp3_link_status_request()
+        assert req.startswith(b"\x05\x64")
+        assert _parse_dnp3_response(bytes.fromhex("0564050b010000000000")) is True
+
+    def test_bacnet_builder_and_parser(self):
+        req = _build_bacnet_who_is_request()
+        assert req.startswith(b"\x81\x0a")
+        assert _parse_bacnet_response(bytes.fromhex("810a000801201000")) is True
 
 
 class TestBannerGrab:

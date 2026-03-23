@@ -13,6 +13,7 @@ setup(
     entry_points={
         "console_scripts": [
             "ics_finder=ics_finder.main:main",
+            "ics_finder_dashboard=ics_finder.webapp:main",
         ],
     },
 )
