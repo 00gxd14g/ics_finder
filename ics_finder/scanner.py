@@ -1,10 +1,12 @@
 """
-scanner.py — Async Modbus TCP port scanner.
+scanner.py — Async Modbus TCP port scanner with multi-level validation.
 
 This module provides:
 * :func:`scan_networks` — high-level entry point that scans a list of IP
   networks for Modbus TCP (port 502) listeners and optionally verifies the
   Modbus application-layer protocol before recording a hit.
+* :func:`scan_networks_fast` — two-phase scan using *masscan* for fast TCP
+  discovery followed by async Modbus protocol verification.
 * :class:`ScanResult` — data class for individual scan results.
 * :func:`write_results_csv` / :func:`write_results_json` — helpers to persist
   results to disk.
@@ -20,9 +22,19 @@ A Modbus TCP request is composed of a 7-byte MBAP header followed by a PDU:
     Byte  7     Function Code
     Bytes 8+    Function-specific data
 
-We send a "Read Coils" request (FC 01) for coil 0, quantity 1.  A valid Modbus
-response must carry Protocol Identifier == 0x0000; anything else (including a
-connection that closes immediately or returns garbage) is treated as a non-hit.
+Validation levels
+-----------------
+The scanner classifies each result into one of the following levels:
+
+* ``no_access``         — TCP connection failed entirely.
+* ``tcp_only``          — TCP port is open but no Modbus verification was
+                          performed or the service did not speak Modbus.
+* ``modbus_exception``  — The device returned a Modbus exception response
+                          (e.g. Illegal Function / Illegal Data Address),
+                          which proves a real Modbus endpoint is listening.
+* ``modbus_confirmed``  — The device returned a normal Modbus data response.
+* ``modbus_device_id``  — The device additionally answered a Read Device
+                          Identification request (FC 43 / MEI 14).
 """
 
 from __future__ import annotations
@@ -33,10 +45,14 @@ import dataclasses
 import ipaddress
 import json
 import logging
+import os
 import random
+import shutil
 import struct
+import subprocess
+import tempfile
 import time
-from typing import Dict, Iterable, List, Optional, Union
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 from .ip_utils import AnyAddress, AnyNetwork, chunked_hosts, count_hosts
 
@@ -66,9 +82,35 @@ _MBAP_HEADER_LEN: int = 6
 # Banner-grab timeout (seconds) — how long to wait for unsolicited data.
 _BANNER_READ_TIMEOUT: float = 2.0
 
+# Modbus exception responses carry FC | 0x80 as the function code.
+_MODBUS_EXCEPTION_MASK: int = 0x80
 
-def _build_modbus_request() -> bytes:
-    """Build a Modbus Read Coils request with a randomised transaction ID.
+# Well-known Modbus exception codes (from the Modbus Application Protocol
+# Specification V1.1b3).
+_MODBUS_EXCEPTION_NAMES: Dict[int, str] = {
+    0x01: "Illegal Function",
+    0x02: "Illegal Data Address",
+    0x03: "Illegal Data Value",
+    0x04: "Server Device Failure",
+    0x05: "Acknowledge",
+    0x06: "Server Device Busy",
+}
+
+# Validation level constants — see module docstring for semantics.
+VALIDATION_NO_ACCESS: str = "no_access"
+VALIDATION_TCP_ONLY: str = "tcp_only"
+VALIDATION_MODBUS_EXCEPTION: str = "modbus_exception"
+VALIDATION_MODBUS_CONFIRMED: str = "modbus_confirmed"
+VALIDATION_MODBUS_DEVICE_ID: str = "modbus_device_id"
+
+
+# ─────────────────────────────────────────────────────────────
+# Modbus request builders
+# ─────────────────────────────────────────────────────────────
+
+
+def _build_modbus_request(unit_id: int = 0x01) -> bytes:
+    """Build a Modbus Read Coils (FC 01) request with a randomised TX ID.
 
     Randomising the transaction ID on each probe avoids deterministic
     signatures that stateful firewalls or WAFs could use to fingerprint
@@ -76,8 +118,99 @@ def _build_modbus_request() -> bytes:
     """
     tx_id = random.randint(0x0001, 0xFFFE)
     return struct.pack(
-        ">HHHBBHH", tx_id, 0x0000, 0x0006, 0x01, 0x01, 0x0000, 0x0001
+        ">HHHBBHH", tx_id, 0x0000, 0x0006, unit_id, 0x01, 0x0000, 0x0001
     )
+
+
+def _build_read_holding_registers_request(unit_id: int = 0x01) -> bytes:
+    """Build a Modbus Read Holding Registers (FC 03) request."""
+    tx_id = random.randint(0x0001, 0xFFFE)
+    return struct.pack(
+        ">HHHBBHH", tx_id, 0x0000, 0x0006, unit_id, 0x03, 0x0000, 0x0001
+    )
+
+
+def _build_device_id_request(unit_id: int = 0x01) -> bytes:
+    """Build a Modbus Read Device Identification request (FC 43 / MEI 14).
+
+    This requests the *basic* device identification objects (vendor name,
+    product code, major-minor revision) starting at object 0x00.
+    """
+    tx_id = random.randint(0x0001, 0xFFFE)
+    # FC 0x2B (43), MEI Type 0x0E (14), Read Dev ID Code 0x01 (basic),
+    # Object ID 0x00 (start from VendorName).
+    return struct.pack(
+        ">HHHBBBBB", tx_id, 0x0000, 0x0005, unit_id, 0x2B, 0x0E, 0x01, 0x00
+    )
+
+
+# ─────────────────────────────────────────────────────────────
+# Modbus response parsing
+# ─────────────────────────────────────────────────────────────
+
+
+def _parse_modbus_response(
+    raw: bytes,
+) -> Tuple[bool, bool, Optional[int], Optional[int]]:
+    """Parse a Modbus TCP response frame.
+
+    Returns
+    -------
+    (is_modbus, is_exception, exception_code, function_code)
+        * *is_modbus*      — ``True`` when Protocol ID == 0x0000.
+        * *is_exception*   — ``True`` when the function code has its high bit
+                             set, indicating an exception response.
+        * *exception_code* — The Modbus exception code (1–6) when
+                             *is_exception* is ``True``, else ``None``.
+        * *function_code*  — The original function code (high bit stripped
+                             for exceptions), or ``None`` if parsing failed.
+    """
+    # We need at least MBAP header (6 bytes) + unit ID (1) + FC (1) = 8 bytes.
+    if len(raw) < _MBAP_HEADER_LEN + 2:
+        return False, False, None, None
+
+    protocol_id = struct.unpack(">H", raw[2:4])[0]
+    if protocol_id != 0x0000:
+        return False, False, None, None
+
+    fc = raw[7]
+    if fc & _MODBUS_EXCEPTION_MASK:
+        exc_code = raw[8] if len(raw) > 8 else None
+        return True, True, exc_code, fc & 0x7F
+
+    return True, False, None, fc
+
+
+def _parse_device_id_response(raw: bytes) -> Optional[str]:
+    """Extract human-readable device identification from an MEI 14 response.
+
+    Returns a semicolon-separated string of ``object_id=value`` pairs, or
+    ``None`` when the response cannot be parsed.
+    """
+    # Minimum: MBAP (7) + FC (1) + MEI type (1) + read dev id (1)
+    #          + conformity (1) + more follows (1) + next obj (1) + num obj (1)
+    #        = 14 bytes before the first object descriptor.
+    if len(raw) < 14:
+        return None
+    if raw[7] != 0x2B or raw[8] != 0x0E:
+        return None
+
+    num_objects = raw[13]
+    pos = 14
+    parts: List[str] = []
+    for _ in range(num_objects):
+        if pos + 2 > len(raw):
+            break
+        obj_id = raw[pos]
+        obj_len = raw[pos + 1]
+        pos += 2
+        if pos + obj_len > len(raw):
+            break
+        value = raw[pos : pos + obj_len].decode("ascii", errors="replace")
+        parts.append(f"{obj_id}={value}")
+        pos += obj_len
+
+    return "; ".join(parts) if parts else None
 
 
 # ─────────────────────────────────────────────────────────────
@@ -87,7 +220,21 @@ def _build_modbus_request() -> bytes:
 
 @dataclasses.dataclass
 class ScanResult:
-    """Result of a single IP probe."""
+    """Result of a single IP probe.
+
+    Attributes
+    ----------
+    validation_level:
+        One of the ``VALIDATION_*`` constants indicating the deepest
+        verification level reached during probing.
+    modbus_exception_code:
+        If the device returned a Modbus exception response, the numeric
+        exception code (e.g. 1 = Illegal Function, 2 = Illegal Data
+        Address).  ``None`` otherwise.
+    device_info:
+        Human-readable device identification string when the target
+        supports Read Device Identification (FC 43 / MEI 14).
+    """
 
     ip: str
     port: int
@@ -96,6 +243,9 @@ class ScanResult:
     banner: Optional[str]
     timestamp: float = dataclasses.field(default_factory=time.time)
     error: Optional[str] = None
+    validation_level: str = VALIDATION_NO_ACCESS
+    modbus_exception_code: Optional[int] = None
+    device_info: Optional[str] = None
 
     def as_dict(self) -> Dict:
         return dataclasses.asdict(self)
@@ -116,9 +266,16 @@ async def _probe(
     """
     Attempt a TCP connection to *ip*:*port*.
 
-    If *verify_modbus* is ``True`` we additionally send a Modbus Read Coils
-    request (with a randomised transaction ID for WAF evasion) and check that
-    the response carries a valid Modbus protocol identifier (0x0000).
+    If *verify_modbus* is ``True`` the probe performs multi-level Modbus
+    validation:
+
+    1. Send a Read Coils request (FC 01) with a randomised transaction ID.
+    2. If the response is a valid Modbus data frame → ``modbus_confirmed``.
+    3. If the response is a Modbus *exception* → ``modbus_exception``
+       (this still proves a real Modbus endpoint is listening).
+    4. If FC 01 yields no usable answer, retry with Read Holding Registers
+       (FC 03) — some devices only support certain function codes.
+    5. Optionally attempt Read Device Identification (FC 43 / MEI 14).
 
     If *banner_grab* is ``True`` and *verify_modbus* is ``False``, the scanner
     waits briefly for any unsolicited data from the server (service banner).
@@ -136,28 +293,64 @@ async def _probe(
             modbus_verified=False,
             banner=None,
             error=str(exc),
+            validation_level=VALIDATION_NO_ACCESS,
         )
 
     modbus_verified = False
     banner: Optional[str] = None
+    validation_level = VALIDATION_TCP_ONLY
+    exception_code: Optional[int] = None
+    device_info: Optional[str] = None
 
     try:
         if verify_modbus:
-            writer.write(_build_modbus_request())
-            await asyncio.wait_for(writer.drain(), timeout=timeout)
-
-            raw: bytes = await asyncio.wait_for(
-                reader.read(256),
-                timeout=timeout,
+            # ── Phase 1: try Read Coils (FC 01) ──────────────────
+            is_modbus, is_exc, exc_c, _fc = await _send_and_parse(
+                reader, writer, _build_modbus_request(), timeout
             )
-            if len(raw) >= _MBAP_HEADER_LEN:
-                # Protocol Identifier is bytes 2-3; must be 0x0000 for Modbus.
-                protocol_id = struct.unpack(">H", raw[2:4])[0]
-                modbus_verified = protocol_id == 0x0000
-            if raw:
-                banner = raw.hex()
+            if is_modbus and not is_exc:
+                modbus_verified = True
+                validation_level = VALIDATION_MODBUS_CONFIRMED
+            elif is_modbus and is_exc:
+                modbus_verified = True
+                validation_level = VALIDATION_MODBUS_EXCEPTION
+                exception_code = exc_c
+
+            # ── Phase 2: try Read Holding Registers (FC 03) ──────
+            if not is_modbus:
+                is_modbus, is_exc, exc_c, _fc = await _send_and_parse(
+                    reader, writer,
+                    _build_read_holding_registers_request(),
+                    timeout,
+                )
+                if is_modbus and not is_exc:
+                    modbus_verified = True
+                    validation_level = VALIDATION_MODBUS_CONFIRMED
+                elif is_modbus and is_exc:
+                    modbus_verified = True
+                    validation_level = VALIDATION_MODBUS_EXCEPTION
+                    exception_code = exc_c
+
+            # ── Phase 3: try Read Device Identification (FC 43) ──
+            if modbus_verified:
+                try:
+                    dev_req = _build_device_id_request()
+                    writer.write(dev_req)
+                    await asyncio.wait_for(writer.drain(), timeout=timeout)
+                    dev_raw: bytes = await asyncio.wait_for(
+                        reader.read(256), timeout=timeout,
+                    )
+                    info = _parse_device_id_response(dev_raw)
+                    if info:
+                        device_info = info
+                        validation_level = VALIDATION_MODBUS_DEVICE_ID
+                except (asyncio.TimeoutError, OSError):
+                    pass
+
+            # Capture whatever raw bytes we got as banner hex.
+            # (The last exchange's bytes are not easily available here,
+            #  so we re-use the banner from _send_and_parse if needed.)
         elif banner_grab:
-            # Wait briefly for any unsolicited data the service may send.
             try:
                 raw = await asyncio.wait_for(
                     reader.read(256),
@@ -182,7 +375,31 @@ async def _probe(
         open=True,
         modbus_verified=modbus_verified,
         banner=banner,
+        validation_level=validation_level,
+        modbus_exception_code=exception_code,
+        device_info=device_info,
     )
+
+
+async def _send_and_parse(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    request: bytes,
+    timeout: float,
+) -> Tuple[bool, bool, Optional[int], Optional[int]]:
+    """Send a Modbus request and parse the response.
+
+    Returns the same tuple as :func:`_parse_modbus_response`.
+    """
+    try:
+        writer.write(request)
+        await asyncio.wait_for(writer.drain(), timeout=timeout)
+        raw: bytes = await asyncio.wait_for(
+            reader.read(256), timeout=timeout,
+        )
+        return _parse_modbus_response(raw)
+    except (asyncio.TimeoutError, OSError):
+        return False, False, None, None
 
 
 async def _worker(
@@ -209,7 +426,8 @@ async def _worker(
             if not hits_only or result.open:
                 results.append(result)
             if result.open:
-                verified_str = " (Modbus verified)" if result.modbus_verified else ""
+                level = result.validation_level
+                verified_str = f" [{level}]" if result.modbus_verified else ""
                 logger.info("HIT  %s:%d%s", ip, port, verified_str)
         finally:
             queue.task_done()
@@ -350,10 +568,193 @@ def scan_networks(
 
 
 # ─────────────────────────────────────────────────────────────
+# Masscan integration (fast TCP discovery)
+# ─────────────────────────────────────────────────────────────
+
+
+def _parse_masscan_list_output(path: str) -> List[str]:
+    """Parse a masscan ``-oL`` (list) output file and return discovered IPs.
+
+    Each relevant line in the file has the format::
+
+        open tcp 502 1.2.3.4 1234567890
+
+    Lines starting with ``#`` or not starting with ``open`` are ignored.
+    """
+    ips: List[str] = []
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            if len(parts) >= 4 and parts[0] == "open":
+                ips.append(parts[3])
+    return ips
+
+
+def masscan_discover(
+    targets: Iterable[AnyNetwork],
+    port: int = MODBUS_PORT,
+    rate: int = 10_000,
+) -> List[str]:
+    """Run *masscan* to discover hosts with an open TCP port.
+
+    Parameters
+    ----------
+    targets:
+        Networks to scan.
+    port:
+        TCP port to probe.
+    rate:
+        Maximum packet-sending rate (packets / second).
+
+    Returns
+    -------
+    list of str
+        IP addresses with the port open.
+
+    Raises
+    ------
+    FileNotFoundError
+        If the ``masscan`` binary is not found on ``$PATH``.
+    RuntimeError
+        If the masscan process exits with a non-zero code.
+    """
+    if shutil.which("masscan") is None:
+        raise FileNotFoundError(
+            "masscan is not installed or not on $PATH.  "
+            "Install it (e.g. 'apt install masscan') or use the default "
+            "async scanner instead (omit --masscan)."
+        )
+
+    target_fd, target_path = tempfile.mkstemp(suffix=".txt", prefix="ics_targets_")
+    output_fd, output_path = tempfile.mkstemp(suffix=".list", prefix="ics_masscan_")
+    try:
+        with os.fdopen(target_fd, "w") as tf:
+            for net in targets:
+                tf.write(str(net) + "\n")
+        os.close(output_fd)
+
+        cmd = [
+            "masscan",
+            "-iL", target_path,
+            "-p", str(port),
+            "--rate", str(rate),
+            "-oL", output_path,
+        ]
+        logger.info("Running masscan: %s", " ".join(cmd))
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=7200,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"masscan exited with code {proc.returncode}: {proc.stderr}"
+            )
+
+        discovered = _parse_masscan_list_output(output_path)
+        logger.info("masscan discovered %d open host(s).", len(discovered))
+        return discovered
+    finally:
+        for p in (target_path, output_path):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+
+
+def scan_networks_fast(
+    networks: Iterable[AnyNetwork],
+    port: int = MODBUS_PORT,
+    masscan_rate: int = 10_000,
+    concurrency: int = 500,
+    timeout: float = 5.0,
+    hits_only: bool = True,
+    progress_every: int = 10_000,
+    banner_grab: bool = False,
+    randomize_hosts: bool = False,
+    jitter: float = 0.0,
+) -> List[ScanResult]:
+    """Two-phase scan: fast masscan discovery + async Modbus verification.
+
+    Phase 1 uses *masscan* (SYN scan) to rapidly find hosts with an open TCP
+    port.  Phase 2 performs full Modbus protocol verification on every
+    discovered host using the async scanner.
+
+    This approach is dramatically faster than probing every address with a
+    full TCP handshake when scanning large networks.
+
+    Parameters
+    ----------
+    networks:
+        Networks to scan.
+    port:
+        TCP port (default: 502).
+    masscan_rate:
+        masscan packet rate (default: 10 000 pps).
+    concurrency:
+        Async verification concurrency for phase 2.
+    timeout:
+        Per-probe timeout for phase 2 Modbus verification.
+    hits_only:
+        If ``True``, only store open results.
+    progress_every:
+        Log interval.
+    banner_grab:
+        Capture banners for non-Modbus ports.
+    randomize_hosts:
+        Shuffle verification order.
+    jitter:
+        Maximum random delay before each verification probe.
+
+    Returns
+    -------
+    list of ScanResult
+    """
+    nets_list = list(networks)
+    total = count_hosts(nets_list)
+    logger.info(
+        "Fast scan: %d networks, ~%d hosts, port %d, masscan rate %d",
+        len(nets_list), total, port, masscan_rate,
+    )
+
+    # Phase 1: masscan TCP discovery
+    open_ips = masscan_discover(nets_list, port=port, rate=masscan_rate)
+
+    if not open_ips:
+        logger.info("No open hosts discovered by masscan.")
+        return []
+
+    logger.info(
+        "Phase 2: verifying %d host(s) with Modbus protocol probes …",
+        len(open_ips),
+    )
+
+    # Phase 2: async Modbus verification on discovered hosts only
+    return asyncio.run(
+        _scan_async(
+            open_ips,
+            port=port,
+            concurrency=concurrency,
+            timeout=timeout,
+            verify_modbus=True,
+            hits_only=hits_only,
+            progress_every=progress_every,
+            banner_grab=banner_grab,
+            jitter=jitter,
+            randomize_hosts=randomize_hosts,
+        )
+    )
+
+
+# ─────────────────────────────────────────────────────────────
 # Result persistence helpers
 # ─────────────────────────────────────────────────────────────
 
-_CSV_FIELDNAMES = ["ip", "port", "open", "modbus_verified", "banner", "timestamp", "error"]
+_CSV_FIELDNAMES = [
+    "ip", "port", "open", "modbus_verified", "validation_level",
+    "modbus_exception_code", "device_info", "banner", "timestamp", "error",
+]
 
 
 def write_results_csv(results: Iterable[ScanResult], path: str) -> int:

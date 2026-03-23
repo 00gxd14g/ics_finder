@@ -21,6 +21,17 @@ from ics_finder.scanner import (
     MODBUS_PORT,
     _MODBUS_READ_COILS,
     _build_modbus_request,
+    _build_read_holding_registers_request,
+    _build_device_id_request,
+    _parse_modbus_response,
+    _parse_device_id_response,
+    _parse_masscan_list_output,
+    _MODBUS_EXCEPTION_MASK,
+    VALIDATION_NO_ACCESS,
+    VALIDATION_TCP_ONLY,
+    VALIDATION_MODBUS_EXCEPTION,
+    VALIDATION_MODBUS_CONFIRMED,
+    VALIDATION_MODBUS_DEVICE_ID,
 )
 
 
@@ -63,14 +74,17 @@ def _build_modbus_response(transaction_id: int = 0x0001) -> bytes:
 
 
 def _start_modbus_stub_server() -> tuple[socket.socket, int]:
-    """Start a TCP server that responds with a valid Modbus response."""
+    """Start a TCP server that responds with a valid Modbus response.
+
+    The server handles multiple sequential requests on the same connection
+    so that the multi-level verification logic can send FC 01, FC 03, and
+    FC 43 probes in sequence.
+    """
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("127.0.0.1", 0))
     srv.listen(5)
     port = srv.getsockname()[1]
-
-    response = _build_modbus_response()
 
     def _handle():
         srv.settimeout(5)
@@ -78,9 +92,18 @@ def _start_modbus_stub_server() -> tuple[socket.socket, int]:
             while True:
                 try:
                     conn, _ = srv.accept()
-                    conn.recv(12)   # consume the request
-                    conn.sendall(response)
-                    conn.close()
+                    conn.settimeout(2)
+                    try:
+                        while True:
+                            data = conn.recv(12)
+                            if not data:
+                                break
+                            response = _build_modbus_response()
+                            conn.sendall(response)
+                    except socket.timeout:
+                        pass
+                    finally:
+                        conn.close()
                 except socket.timeout:
                     break
         except OSError:
@@ -132,7 +155,11 @@ class TestScanResult:
             banner=None,
         )
         d = r.as_dict()
-        assert set(d.keys()) == {"ip", "port", "open", "modbus_verified", "banner", "timestamp", "error"}
+        assert set(d.keys()) == {
+            "ip", "port", "open", "modbus_verified", "banner",
+            "timestamp", "error", "validation_level",
+            "modbus_exception_code", "device_info",
+        }
 
     def test_defaults(self):
         r = ScanResult(ip="1.2.3.4", port=502, open=False, modbus_verified=False, banner=None)
@@ -364,3 +391,354 @@ class TestJitter:
 
         assert len(results) == 1
         assert results[0].open is True
+
+
+# ─────────────────────────────────────────────────────────────
+# Modbus exception response stub server
+# ─────────────────────────────────────────────────────────────
+
+
+def _build_modbus_exception_response(
+    fc: int = 0x01, exception_code: int = 0x02
+) -> bytes:
+    """Build a Modbus TCP exception response.
+
+    An exception response has the original function code OR'd with 0x80,
+    followed by the exception code.
+    """
+    return struct.pack(
+        ">HHHBBB",
+        0x0001,       # Transaction ID
+        0x0000,       # Protocol ID (Modbus)
+        0x0003,       # Length (unit + fc + exc_code = 3)
+        0x01,         # Unit ID
+        fc | 0x80,    # Function code with exception flag
+        exception_code,
+    )
+
+
+def _start_modbus_exception_server(
+    exception_code: int = 0x02,
+) -> tuple[socket.socket, int]:
+    """Start a TCP server that always returns a Modbus exception response."""
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(5)
+    port = srv.getsockname()[1]
+
+    def _handle():
+        srv.settimeout(5)
+        try:
+            while True:
+                try:
+                    conn, _ = srv.accept()
+                    conn.settimeout(2)
+                    try:
+                        while True:
+                            data = conn.recv(12)
+                            if not data:
+                                break
+                            # Parse the incoming FC and echo back an exception
+                            # for that FC.
+                            incoming_fc = data[7] if len(data) > 7 else 0x01
+                            resp = _build_modbus_exception_response(
+                                incoming_fc, exception_code
+                            )
+                            conn.sendall(resp)
+                    except socket.timeout:
+                        pass
+                    finally:
+                        conn.close()
+                except socket.timeout:
+                    break
+        except OSError:
+            pass
+
+    t = threading.Thread(target=_handle, daemon=True)
+    t.start()
+    return srv, port
+
+
+# ─────────────────────────────────────────────────────────────
+# Tests for _parse_modbus_response
+# ─────────────────────────────────────────────────────────────
+
+
+class TestParseModbusResponse:
+    def test_valid_normal_response(self):
+        """A normal Read Coils response should parse correctly."""
+        raw = _build_modbus_response()
+        is_modbus, is_exc, exc_code, fc = _parse_modbus_response(raw)
+        assert is_modbus is True
+        assert is_exc is False
+        assert exc_code is None
+        assert fc == 0x01
+
+    def test_exception_response(self):
+        """An exception response should set is_exception and exception_code."""
+        raw = _build_modbus_exception_response(0x01, 0x02)
+        is_modbus, is_exc, exc_code, fc = _parse_modbus_response(raw)
+        assert is_modbus is True
+        assert is_exc is True
+        assert exc_code == 0x02
+        assert fc == 0x01  # original FC (high bit stripped)
+
+    def test_non_modbus_protocol_id(self):
+        """A frame with non-zero protocol ID should not be Modbus."""
+        raw = struct.pack(">HHHBBBB", 0x0001, 0x0001, 4, 0x01, 0x01, 0x01, 0x00)
+        is_modbus, is_exc, exc_code, fc = _parse_modbus_response(raw)
+        assert is_modbus is False
+
+    def test_too_short(self):
+        """A frame shorter than 8 bytes should not parse."""
+        raw = b"\x00\x01\x00\x00\x00"
+        is_modbus, is_exc, exc_code, fc = _parse_modbus_response(raw)
+        assert is_modbus is False
+
+    def test_illegal_function_exception(self):
+        """Illegal Function (0x01) exception should be detected."""
+        raw = _build_modbus_exception_response(0x03, 0x01)
+        is_modbus, is_exc, exc_code, fc = _parse_modbus_response(raw)
+        assert is_modbus is True
+        assert is_exc is True
+        assert exc_code == 0x01
+        assert fc == 0x03
+
+
+# ─────────────────────────────────────────────────────────────
+# Tests for enhanced Modbus request builders
+# ─────────────────────────────────────────────────────────────
+
+
+class TestReadHoldingRegistersRequest:
+    def test_valid_frame(self):
+        """FC 03 request should be a well-formed 12-byte Modbus frame."""
+        req = _build_read_holding_registers_request()
+        assert len(req) == 12
+        tx_id, proto_id, length, unit, fc, start, qty = struct.unpack(
+            ">HHHBBHH", req
+        )
+        assert proto_id == 0x0000
+        assert length == 0x0006
+        assert fc == 0x03
+
+    def test_custom_unit_id(self):
+        """FC 03 request should honour a custom unit ID."""
+        req = _build_read_holding_registers_request(unit_id=0x05)
+        unit = req[6]
+        assert unit == 0x05
+
+
+class TestDeviceIdRequest:
+    def test_valid_frame(self):
+        """FC 43 / MEI 14 request should be 11 bytes."""
+        req = _build_device_id_request()
+        assert len(req) == 11
+        # FC should be 0x2B (43)
+        assert req[7] == 0x2B
+        # MEI Type should be 0x0E (14)
+        assert req[8] == 0x0E
+
+
+# ─────────────────────────────────────────────────────────────
+# Tests for _parse_device_id_response
+# ─────────────────────────────────────────────────────────────
+
+
+class TestParseDeviceIdResponse:
+    def _build_device_id_response(self) -> bytes:
+        """Build a minimal Read Device Identification response."""
+        vendor = b"TestVendor"
+        product = b"TestProduct"
+        # Objects: 0=VendorName, 1=ProductCode
+        objects = (
+            bytes([0x00, len(vendor)]) + vendor
+            + bytes([0x01, len(product)]) + product
+        )
+        # PDU: unit(1) + FC(1) + MEI(1) + ReadDevId(1) + ConformityLevel(1)
+        #      + MoreFollows(1) + NextObjId(1) + NumObjects(1) + objects
+        pdu = struct.pack("BBBBBBBB", 0x01, 0x2B, 0x0E, 0x01, 0x01, 0x00, 0x00, 0x02) + objects
+        length = len(pdu)
+        mbap = struct.pack(">HHH", 0x0001, 0x0000, length)
+        return mbap + pdu
+
+    def test_parses_vendor_and_product(self):
+        raw = self._build_device_id_response()
+        info = _parse_device_id_response(raw)
+        assert info is not None
+        assert "0=TestVendor" in info
+        assert "1=TestProduct" in info
+
+    def test_returns_none_for_non_device_id(self):
+        """A normal Modbus response should not parse as device ID."""
+        raw = _build_modbus_response()
+        info = _parse_device_id_response(raw)
+        assert info is None
+
+    def test_returns_none_for_short_data(self):
+        info = _parse_device_id_response(b"\x00" * 5)
+        assert info is None
+
+
+# ─────────────────────────────────────────────────────────────
+# Tests for Modbus exception integration
+# ─────────────────────────────────────────────────────────────
+
+
+class TestModbusExceptionDetection:
+    def test_exception_response_marks_verified(self):
+        """A Modbus exception response should still mark the device verified."""
+        srv, port = _start_modbus_exception_server(exception_code=0x01)
+        try:
+            results = scan_networks(
+                [parse_network("127.0.0.1/32")],
+                port=port,
+                concurrency=1,
+                timeout=2.0,
+                verify_modbus=True,
+                hits_only=True,
+            )
+        finally:
+            srv.close()
+
+        assert len(results) == 1
+        assert results[0].open is True
+        assert results[0].modbus_verified is True
+        assert results[0].validation_level == VALIDATION_MODBUS_EXCEPTION
+        assert results[0].modbus_exception_code == 0x01
+
+    def test_illegal_data_address_exception(self):
+        """Illegal Data Address (0x02) should be detected."""
+        srv, port = _start_modbus_exception_server(exception_code=0x02)
+        try:
+            results = scan_networks(
+                [parse_network("127.0.0.1/32")],
+                port=port,
+                concurrency=1,
+                timeout=2.0,
+                verify_modbus=True,
+                hits_only=True,
+            )
+        finally:
+            srv.close()
+
+        assert len(results) == 1
+        assert results[0].modbus_verified is True
+        assert results[0].modbus_exception_code == 0x02
+
+
+# ─────────────────────────────────────────────────────────────
+# Tests for validation levels
+# ─────────────────────────────────────────────────────────────
+
+
+class TestValidationLevel:
+    def test_closed_port_has_no_access(self):
+        """A closed port should have validation_level='no_access'."""
+        results = scan_networks(
+            [parse_network("127.0.0.1/32")],
+            port=19876,
+            concurrency=1,
+            timeout=0.5,
+            verify_modbus=True,
+            hits_only=False,
+        )
+        assert len(results) == 1
+        assert results[0].validation_level == VALIDATION_NO_ACCESS
+
+    def test_open_port_without_verify_has_tcp_only(self):
+        """An open port without Modbus verification should be 'tcp_only'."""
+        srv, port = _start_echo_server()
+        try:
+            results = scan_networks(
+                [parse_network("127.0.0.1/32")],
+                port=port,
+                concurrency=1,
+                timeout=2.0,
+                verify_modbus=False,
+                hits_only=True,
+            )
+        finally:
+            srv.close()
+
+        assert len(results) == 1
+        assert results[0].validation_level == VALIDATION_TCP_ONLY
+
+    def test_modbus_confirmed_level(self):
+        """A valid Modbus response should give 'modbus_confirmed'."""
+        srv, port = _start_modbus_stub_server()
+        try:
+            results = scan_networks(
+                [parse_network("127.0.0.1/32")],
+                port=port,
+                concurrency=1,
+                timeout=2.0,
+                verify_modbus=True,
+                hits_only=True,
+            )
+        finally:
+            srv.close()
+
+        assert len(results) == 1
+        assert results[0].validation_level in (
+            VALIDATION_MODBUS_CONFIRMED,
+            VALIDATION_MODBUS_DEVICE_ID,
+        )
+
+
+# ─────────────────────────────────────────────────────────────
+# Tests for masscan output parsing
+# ─────────────────────────────────────────────────────────────
+
+
+class TestParseMasscanOutput:
+    def test_parse_list_format(self):
+        """Correctly parse masscan -oL output."""
+        content = (
+            "# masscan\n"
+            "open tcp 502 192.168.1.1 1711115200\n"
+            "open tcp 502 10.0.0.5 1711115201\n"
+            "# end\n"
+        )
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".list", delete=False
+        ) as fh:
+            fh.write(content)
+            path = fh.name
+        try:
+            ips = _parse_masscan_list_output(path)
+            assert ips == ["192.168.1.1", "10.0.0.5"]
+        finally:
+            os.unlink(path)
+
+    def test_empty_output(self):
+        """An empty file should return no IPs."""
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".list", delete=False
+        ) as fh:
+            fh.write("# masscan\n# end\n")
+            path = fh.name
+        try:
+            ips = _parse_masscan_list_output(path)
+            assert ips == []
+        finally:
+            os.unlink(path)
+
+    def test_ignores_non_open_lines(self):
+        """Lines not starting with 'open' should be ignored."""
+        content = (
+            "# comment\n"
+            "closed tcp 502 10.0.0.1 1711115200\n"
+            "open tcp 502 10.0.0.2 1711115201\n"
+        )
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".list", delete=False
+        ) as fh:
+            fh.write(content)
+            path = fh.name
+        try:
+            ips = _parse_masscan_list_output(path)
+            assert ips == ["10.0.0.2"]
+        finally:
+            os.unlink(path)
